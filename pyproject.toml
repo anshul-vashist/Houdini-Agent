@@ -9,7 +9,7 @@ description = "Agentic AI for SideFX Houdini 21 — local-first, tool-using, zer
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11,<3.12"
-authors = [{ name = "HoudiniMind Contributors" }]
+authors = [{ name = "Anshul Vashist", email = "vashistanshul.7@gmail.com" }]
 keywords = ["houdini", "sidefx", "agent", "llm", "ollama", "mcp", "fx", "vfx"]
 classifiers = [
     "Development Status :: 4 - Beta",
