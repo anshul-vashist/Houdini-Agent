@@ -4,283 +4,659 @@
       "id": 1,
       "context": "VEX",
       "error": "No matching function for fit(vector, float, float)",
-      "fix": "Check the signature of 'fit'. You are likely passing the wrong number of arguments or incorrect types (e.g., float instead of vector)."
+      "fix": "Check the signature of 'fit'. You are likely passing the wrong number of arguments or incorrect types (e.g., float instead of vector).",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 2,
       "context": "VEX",
       "error": "Call to undefined function 'fit'",
-      "fix": "The function 'fit' does not exist or is not available in the current context (e.g., a SOP function used in a CVEX context)."
+      "fix": "The function 'fit' does not exist or is not available in the current context (e.g., a SOP function used in a CVEX context).",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "high",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 3,
       "context": "VEX",
       "error": "Ambiguous call to function 'fit'",
-      "fix": "VEX cannot decide which overload of 'fit' to use. Cast your arguments explicitly, e.g., float(val)."
+      "fix": "VEX cannot decide which overload of 'fit' to use. Cast your arguments explicitly, e.g., float(val).",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 4,
       "context": "VEX",
       "error": "Invalid attribute specification '@myAttr'",
-      "fix": "The attribute 'myAttr' does not exist on the geometry. Ensure it is created before this wrangle or use a default value: @myAttr = 0;"
+      "fix": "The attribute 'myAttr' does not exist on the geometry. Ensure it is created before this wrangle or use a default value: @myAttr = 0;",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 5,
       "context": "VEX",
       "error": "Syntax error, unexpected 'if'",
-      "fix": "Check for missing semicolons, unmatched parentheses, or typos around the word 'if'."
+      "fix": "Check for missing semicolons, unmatched parentheses, or typos around the word 'if'.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 6,
       "context": "VEX",
       "error": "Division by zero in '1.0/x'",
-      "fix": "Add a small epsilon value to the divisor to prevent mathematical errors: 1.0/x / (val + 1e-6)."
+      "fix": "Add a small epsilon value to the divisor to prevent mathematical errors: 1.0/x / (val + 1e-6).",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 7,
       "context": "VEX",
       "error": "Array index 6 out of bounds",
-      "fix": "The array only has 5 elements. Use the len() function to check bounds before accessing index 6."
+      "fix": "The array only has 5 elements. Use the len() function to check bounds before accessing index 6.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 8,
       "context": "VEX",
       "error": "Inconsistent types for attribute '@myAttr'",
-      "fix": "The attribute 'myAttr' was previously defined as a different type (e.g., float vs vector). Use a different name or force the type with a prefix like v@myAttr."
+      "fix": "The attribute 'myAttr' was previously defined as a different type (e.g., float vs vector). Use a different name or force the type with a prefix like v@myAttr.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 9,
       "context": "VEX",
       "error": "Array index 14 out of bounds",
-      "fix": "The array only has 13 elements. Use the len() function to check bounds before accessing index 14."
+      "fix": "The array only has 13 elements. Use the len() function to check bounds before accessing index 14.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 10,
       "context": "VEX",
       "error": "Array index 22 out of bounds",
-      "fix": "The array only has 21 elements. Use the len() function to check bounds before accessing index 22."
+      "fix": "The array only has 21 elements. Use the len() function to check bounds before accessing index 22.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 11,
       "context": "VEX",
       "error": "Array index 30 out of bounds",
-      "fix": "The array only has 29 elements. Use the len() function to check bounds before accessing index 30."
+      "fix": "The array only has 29 elements. Use the len() function to check bounds before accessing index 30.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 12,
       "context": "VEX",
       "error": "Array index 38 out of bounds",
-      "fix": "The array only has 37 elements. Use the len() function to check bounds before accessing index 38."
+      "fix": "The array only has 37 elements. Use the len() function to check bounds before accessing index 38.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 13,
       "context": "VEX",
       "error": "Array index 46 out of bounds",
-      "fix": "The array only has 45 elements. Use the len() function to check bounds before accessing index 46."
+      "fix": "The array only has 45 elements. Use the len() function to check bounds before accessing index 46.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 14,
       "context": "VEX",
       "error": "Array index 54 out of bounds",
-      "fix": "The array only has 53 elements. Use the len() function to check bounds before accessing index 54."
+      "fix": "The array only has 53 elements. Use the len() function to check bounds before accessing index 54.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 15,
       "context": "VEX",
       "error": "Array index 62 out of bounds",
-      "fix": "The array only has 61 elements. Use the len() function to check bounds before accessing index 62."
+      "fix": "The array only has 61 elements. Use the len() function to check bounds before accessing index 62.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 16,
       "context": "VEX",
       "error": "Array index 70 out of bounds",
-      "fix": "The array only has 69 elements. Use the len() function to check bounds before accessing index 70."
+      "fix": "The array only has 69 elements. Use the len() function to check bounds before accessing index 70.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 17,
       "context": "VEX",
       "error": "Array index 78 out of bounds",
-      "fix": "The array only has 77 elements. Use the len() function to check bounds before accessing index 78."
+      "fix": "The array only has 77 elements. Use the len() function to check bounds before accessing index 78.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 18,
       "context": "VEX",
       "error": "Array index 86 out of bounds",
-      "fix": "The array only has 85 elements. Use the len() function to check bounds before accessing index 86."
+      "fix": "The array only has 85 elements. Use the len() function to check bounds before accessing index 86.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 19,
       "context": "VEX",
       "error": "Array index 94 out of bounds",
-      "fix": "The array only has 93 elements. Use the len() function to check bounds before accessing index 94."
+      "fix": "The array only has 93 elements. Use the len() function to check bounds before accessing index 94.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "vex"
+      ]
     },
     {
       "id": 20,
       "context": "Python",
       "error": "hou.ObjectWasDeleted: Attempt to access a deleted Node",
-      "fix": "The Node reference is stale. Re-fetch the object using hou.node() or hou.item() before calling methods on it."
+      "fix": "The Node reference is stale. Re-fetch the object using hou.node() or hou.item() before calling methods on it.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 21,
       "context": "Python",
       "error": "AttributeError: 'NoneType' object has no attribute 'set'",
-      "fix": "The preceding hou.node() or hou.parm() call returned None. Verify that the path string is correct and the node exists."
+      "fix": "The preceding hou.node() or hou.parm() call returned None. Verify that the path string is correct and the node exists.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 22,
       "context": "Python",
       "error": "hou.PermissionError: Cannot modify Node",
-      "fix": "The node is likely inside a locked HDA or is a managed node. Allow editing on the HDA instance or unlock the node."
+      "fix": "The node is likely inside a locked HDA or is a managed node. Allow editing on the HDA instance or unlock the node.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 23,
       "context": "Python",
       "error": "TypeError: createNode() takes exactly 2 arguments (1 given)",
-      "fix": "Check the Houdini Python documentation for 'createNode'. You are passing an incorrect number of parameters."
+      "fix": "Check the Houdini Python documentation for 'createNode'. You are passing an incorrect number of parameters.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 24,
       "context": "Python",
       "error": "hou.OperationFailed: The attempted operation failed on /obj/geo1",
-      "fix": "Check the Houdini console for more details. This often happens when creating a node of an invalid type or in the wrong context."
+      "fix": "Check the Houdini console for more details. This often happens when creating a node of an invalid type or in the wrong context.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 25,
       "context": "Python",
       "error": "IndexError: list index out of range",
-      "fix": "You are trying to access an element in a list (like points or nodes) that doesn't exist. Check the length of the list first."
+      "fix": "You are trying to access an element in a list (like points or nodes) that doesn't exist. Check the length of the list first.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 26,
       "context": "Python",
       "error": "hou.LoadError: Unable to load asset.hda",
-      "fix": "Verify the file path exists and is accessible. Use hou.expandString('$HIP') to debug path variables."
+      "fix": "Verify the file path exists and is accessible. Use hou.expandString('$HIP') to debug path variables.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "python",
+        "error"
+      ]
     },
     {
       "id": 27,
       "context": "Node_Network",
       "error": "Invalid source at input 0 of polyextrude1",
-      "fix": "The node connected to input 0 is not providing the correct data type or is errored. Check the upstream network."
+      "fix": "The node connected to input 0 is not providing the correct data type or is errored. Check the upstream network.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 28,
       "context": "Node_Network",
       "error": "Cook error in input 0",
-      "fix": "A node upstream of this input has an error. Follow the red error flags up the chain to find the root cause."
+      "fix": "A node upstream of this input has an error. Follow the red error flags up the chain to find the root cause.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 29,
       "context": "Node_Network",
       "error": "Infinite recursion detected in polyextrude1",
-      "fix": "A parameter or expression in 'polyextrude1' is referencing itself or a child node, creating a circular logic loop."
+      "fix": "A parameter or expression in 'polyextrude1' is referencing itself or a child node, creating a circular logic loop.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 30,
       "context": "Node_Network",
       "error": "Unable to read geometry file: model.obj",
-      "fix": "The file path is incorrect or the format is unsupported. Ensure the file extension matches the data (e.g., .bgeo.sc, .obj, .abc)."
+      "fix": "The file path is incorrect or the format is unsupported. Ensure the file extension matches the data (e.g., .bgeo.sc, .obj, .abc).",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 31,
       "context": "Node_Network",
       "error": "Missing attribute 'N' required by polyextrude1",
-      "fix": "The node 'polyextrude1' expects an attribute named 'N' which was not found. Add an Attribute Create or Wrangle node upstream."
+      "fix": "The node 'polyextrude1' expects an attribute named 'N' which was not found. Add an Attribute Create or Wrangle node upstream.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "high",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 32,
       "context": "Node_Network",
       "error": "Input 0 is not connected",
-      "fix": "This node requires a connection on input 0 to function. Connect a valid operator."
+      "fix": "This node requires a connection on input 0 to function. Connect a valid operator.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 33,
       "context": "Node_Network",
       "error": "Geometry has no primitives",
-      "fix": "The input geometry is empty or missing expected components like primitives (points, primitives, or vertices)."
+      "fix": "The input geometry is empty or missing expected components like primitives (points, primitives, or vertices).",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "node_network",
+        "error"
+      ]
     },
     {
       "id": 34,
       "context": "Simulation",
       "error": "Solver 'flipsolver1' failed to initialize",
-      "fix": "Check the simulation start frame and ensure all required objects (Object, Geometry, Data) are connected to the merge node."
+      "fix": "Check the simulation start frame and ensure all required objects (Object, Geometry, Data) are connected to the merge node.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 35,
       "context": "Simulation",
       "error": "Object 'collider_geo' has no geometry for collision",
-      "fix": "The static or rigid body object is referencing an empty SOP path. Assign a valid geometry node."
+      "fix": "The static or rigid body object is referencing an empty SOP path. Assign a valid geometry node.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 36,
       "context": "Simulation",
       "error": "Substepping limit reached in flipsolver1",
-      "fix": "The simulation is unstable. Try increasing the 'Min Substeps' or decreasing the 'Time Step' on the DOP Network."
+      "fix": "The simulation is unstable. Try increasing the 'Min Substeps' or decreasing the 'Time Step' on the DOP Network.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 37,
       "context": "Simulation",
       "error": "Missing simulation data: Velocity",
-      "fix": "The solver expects data type 'Velocity' (e.g., Position, Velocity) which is missing from the input stream."
+      "fix": "The solver expects data type 'Velocity' (e.g., Position, Velocity) which is missing from the input stream.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "high",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 38,
       "context": "Simulation",
       "error": "Unsupported collision type for collider_geo",
-      "fix": "The collision representation (Volume, Bullet, SDF) is not supported by the current solver. Change the 'Collision Representation' parameter."
+      "fix": "The collision representation (Volume, Bullet, SDF) is not supported by the current solver. Change the 'Collision Representation' parameter.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 39,
       "context": "Simulation",
       "error": "FLIP fluid is leaking from collider_geo",
-      "fix": "The collision geometry is too thin or has holes. Increase the collision thickness or the grid resolution of the FLIP solver."
+      "fix": "The collision geometry is too thin or has holes. Increase the collision thickness or the grid resolution of the FLIP solver.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 40,
       "context": "Simulation",
       "error": "RBD Object 'collider_geo' has non-convex geometry",
-      "fix": "Bullet solver works best with convex hulls. Switch the collision type to 'Convex Hull' or decompose the geometry into convex pieces."
+      "fix": "Bullet solver works best with convex hulls. Switch the collision type to 'Convex Hull' or decompose the geometry into convex pieces.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "error",
+        "simulation"
+      ]
     },
     {
       "id": 41,
       "context": "Rendering",
       "error": "Unable to find shader '/mat/principled1'",
-      "fix": "The material path is invalid or the material was deleted. Update the 'shop_materialpath' attribute or the material parameter on the OBJ node."
+      "fix": "The material path is invalid or the material was deleted. Update the 'shop_materialpath' attribute or the material parameter on the OBJ node.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     },
     {
       "id": 42,
       "context": "Rendering",
       "error": "Missing texture file: diffuse.jpg",
-      "fix": "The renderer cannot find the image at diffuse.jpg. Check your $HIP and $JOB paths or ensure the file was exported."
+      "fix": "The renderer cannot find the image at diffuse.jpg. Check your $HIP and $JOB paths or ensure the file was exported.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "high",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     },
     {
       "id": 43,
       "context": "Rendering",
       "error": "Renderer 'Karma' not found",
-      "fix": "Ensure the render engine (Karma, Mantra, Redshift) is installed and the license is active."
+      "fix": "Ensure the render engine (Karma, Mantra, Redshift) is installed and the license is active.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "high",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     },
     {
       "id": 44,
       "context": "Rendering",
       "error": "Geometry attribute 'Cd' not exported to renderer",
-      "fix": "Check the ROP node settings to ensure the attribute 'Cd' is included in the 'Attributes to Export' list."
+      "fix": "Check the ROP node settings to ensure the attribute 'Cd' is included in the 'Attributes to Export' list.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     },
     {
       "id": 45,
       "context": "Rendering",
       "error": "Sampling error in material /mat/principled1: Out of memory",
-      "fix": "The shader is too complex or the texture resolution is too high for the available GPU/CPU memory. Optimize your textures or simplify the shader graph."
+      "fix": "The shader is too complex or the texture resolution is too high for the available GPU/CPU memory. Optimize your textures or simplify the shader graph.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     },
     {
       "id": 46,
       "context": "Rendering",
       "error": "USD Primitive '/ASSET/mesh' has no material assigned",
-      "fix": "In Solaris (LOPs), ensure a Material Assign node is targeting the primitive path '/ASSET/mesh'."
+      "fix": "In Solaris (LOPs), ensure a Material Assign node is targeting the primitive path '/ASSET/mesh'.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     },
     {
       "id": 47,
       "context": "Rendering",
       "error": "Invalid light path: /ASSET/mesh",
-      "fix": "The render node is trying to reference a light that doesn't exist. Check the 'Force Lights' or 'Candidate Lights' parameters."
+      "fix": "The render node is trying to reference a light that doesn't exist. Check the 'Force Lights' or 'Candidate Lights' parameters.",
+      "_source": "Houdini troubleshooting database",
+      "_source_path": "houdini_troubleshooting_knowledge",
+      "_source_type": "error_fix",
+      "severity": "medium",
+      "tags": [
+        "rendering",
+        "error"
+      ]
     }
   ]
 }
