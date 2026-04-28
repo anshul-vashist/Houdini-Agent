@@ -34,10 +34,10 @@ jobs:
       - name: Check artefacts
         run: twine check dist/*
 
-      - name: Publish to PyPI (trusted publisher)
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
+      # - name: Publish to PyPI (trusted publisher)
+      #   uses: pypa/gh-action-pypi-publish@release/v1
+      #   with:
+      #     skip-existing: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
