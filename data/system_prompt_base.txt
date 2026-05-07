@@ -109,6 +109,56 @@ If the user asks for a simple model (like a table, chair, or sphere), build ONLY
 - Never pass `node_type: null` or omit it — this will fail with a validation
   error. If you are unsure of the type, call `verify_node_type` first.
 
+### R12 — Reach for the higher-tier tool first
+There is a hierarchy of tools. Always start at the top of this list and
+fall down only when nothing higher fits:
+1. **Sim setup tools** (`setup_pyro_sim`, `setup_flip_fluid`,
+   `setup_vellum_cloth`, `setup_rbd_fracture`, `setup_grain_sim`,
+   `setup_wire_solver`, `setup_feather_sim`, `setup_crowd_sim`) — one
+   call wires the whole solver correctly.
+2. **Repair / suggestion tools** (`suggest_node_repairs`,
+   `audit_spatial_layout`, `check_geometry_issues`) — encode expert
+   diagnostic logic; cheaper than re-deriving from raw errors.
+3. **Chain tools** (`create_node_chain`) — wire ≥3 SOPs in one call.
+   Required for multi-input nodes (`copytopoints`, `merge`, `boolean`,
+   `attribtransfer`) per R7.
+4. **Primitives** (`create_node`, `safe_set_parameter`, `connect_nodes`)
+   — only when the higher tiers do not cover the case.
+Reaching for primitives when a higher-tier tool exists wastes turns and
+multiplies failure surface.
+
+### R13 — VEX wrangle when the math wins
+Prefer a single `attribwrangle` (detail class) over a chain of N nodes
+when the work is a loop with simple arithmetic. Examples:
+- Generating N points along a spline with computed positions.
+- Building staircase treads/risers with `addpoint()` / `addprim()` in a
+  for-loop (see Straight Staircase HDA recipe).
+- Per-point attribute math that `attribcreate` would require five
+  separate nodes for.
+Use node-based flow (copytopoints, polyextrude, sweep) when the work is
+**geometry transformation**, not math. Rule of thumb: if you would
+write `for (int i = 0; i < N; i++)` in pseudocode, that's a wrangle.
+
+### R14 — Diff-minimal edits on existing scenes
+When the user asks for a tweak to a working scene ("make the chair
+taller", "more rungs", "less foam"), modify the existing parameters
+on the existing nodes. Do NOT rebuild from scratch. Workflow:
+1. `get_scene_summary` (or rely on injected scene context) to find the
+   relevant nodes.
+2. `get_node_parameters` on the node whose value the user wants changed.
+3. `safe_set_parameter` to apply the change.
+A rebuild is a last resort when the existing topology can't satisfy
+the request — and when you do rebuild, say so explicitly: "Existing
+network can't <reason>; rebuilding."
+
+### R15 — Cook-then-check before claiming done
+After any mutation chain, before writing a "done" message, call
+`get_all_errors`. If any nodes report errors, do not claim success —
+either fix them under the R8 fix-forward rule, or surface them
+honestly: "⚠ <node_path>: <error>." Silent errors are worse than
+loud failures because the user discovers them later, in the viewport,
+without context.
+
 ═══════════════════════════════════════════════════
  FX SIMS (one-call setup; use them)
 ═══════════════════════════════════════════════════

@@ -1021,6 +1021,9 @@ class AgentLoop:
         self._turn_checkpoint_attempted = False
         self._last_turn_final_viewport_b64 = None
         self._last_origin_issues: set = set()  # for stuck-node detection across repair rounds
+        # Node-level errors already surfaced to the LLM this turn — prevents
+        # re-injecting the same error every round once the model has been told.
+        self._seen_node_error_signatures: set = set()
         self._turn_hou_main_thread_blocked = False
         self._plan_verification_count = 0
         self._turn_validation_failed = False
@@ -5746,6 +5749,23 @@ class AgentLoop:
                     "I'm correcting the failed step and continuing from where I left off.",
                 )
             else:
+                # R15 cook-then-check: before considering the round 'done',
+                # surface any node-level errors the model hasn't seen yet.
+                node_error_msg = self._harvest_post_round_node_errors(
+                    round_tool_names, request_mode, dry_run
+                )
+                if node_error_msg:
+                    current_messages.append({"role": "user", "content": node_error_msg})
+                    if stream_callback:
+                        stream_callback(
+                            "​🔎 Cook-then-check found node errors. Asking the model to fix.\n\n"
+                        )
+                    self.debug_logger.log_phase(
+                        "post_round_node_errors",
+                        status="warn",
+                        meta={"round": round_num},
+                    )
+                    continue
                 stable_outputs = self._stable_outputs_for_early_completion(
                     request_mode,
                     round_num,
@@ -6426,6 +6446,65 @@ class AgentLoop:
         if error_text:
             prefix += f" Backend issue: {str(error_text).strip()[:180]}"
         return (prefix + ("\n\n" + summary if summary else "")).strip()
+
+    def _harvest_post_round_node_errors(
+        self,
+        round_tool_names: list[str],
+        request_mode: str,
+        dry_run: bool,
+    ) -> str | None:
+        """After a write-round with no tool-call failures, scan the scene for
+        node-level errors (red triangles) the LLM hasn't yet been told about.
+        Forces R15 (cook-then-check) at the loop level so the model can't
+        declare success while a downstream node is silently broken.
+
+        Returns a guidance message to inject as the next user turn, or None
+        if there's nothing new to surface.
+        """
+        if dry_run or not HOU_AVAILABLE:
+            return None
+        if request_mode not in {"build", "debug"}:
+            return None
+        if not self._round_has_substantive_writes(round_tool_names):
+            return None
+        fn = TOOL_FUNCTIONS.get("get_all_errors")
+        if not fn:
+            return None
+        try:
+            result = self._hou_call(fn, include_warnings=False)
+        except Exception:
+            return None
+        result = self._sanitize(result) if result else result
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return None
+        nodes = (result.get("data") or {}).get("nodes") or []
+        new_issues: list[str] = []
+        for node in nodes:
+            if node.get("severity") != "error":
+                continue
+            path = node.get("path") or ""
+            raw_msg = node.get("message") or node.get("error") or ""
+            if isinstance(raw_msg, list):
+                raw_msg = "; ".join(str(m) for m in raw_msg)
+            msg = str(raw_msg)[:240]
+            sig = f"{path}::{msg[:80]}"
+            if sig in self._seen_node_error_signatures:
+                continue
+            self._seen_node_error_signatures.add(sig)
+            new_issues.append(f"- `{path}`: {msg}")
+            if len(new_issues) >= 6:
+                break
+        if not new_issues:
+            return None
+        return (
+            "🔎 COOK-THEN-CHECK (R15): node errors detected after this round.\n"
+            + "\n".join(new_issues)
+            + "\n\nDo NOT declare the task done while these errors remain. "
+            "Apply a surgical R8 fix-forward (one safe_set_parameter or "
+            "connect_nodes per failing node), or — if the error is genuinely "
+            "outside scope — surface it explicitly in your final message as "
+            "'⚠ <node>: <reason>.'"
+        )
 
     @staticmethod
     def _round_has_substantive_writes(round_tool_names: list[str]) -> bool:
