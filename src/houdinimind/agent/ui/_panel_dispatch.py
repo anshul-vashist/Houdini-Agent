@@ -11,6 +11,8 @@ import traceback
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from houdinimind.agent import mcp_houdini_server
+
 from ._widgets import (
     HOU_AVAILABLE,
     FailureActionStrip,
@@ -18,6 +20,7 @@ from ._widgets import (
     ModernStyles,
     ResearchOptionsWidget,
     ToolActivityGroup,
+    TurnSummaryWidget,
 )
 
 
@@ -75,6 +78,11 @@ class PanelDispatchMixin:
             timer.stop()
 
     def _connect_signals(self):
+        self.send_btn.setToolTip("Send (Ctrl+Enter)")
+        self.stop_btn.setToolTip("Stop at next safe checkpoint (Esc)")
+        self.scene_btn.setToolTip("Sync Scene (Ctrl+Shift+S)")
+        self.network_inspect_btn.setToolTip("Inspect Network (Ctrl+I)")
+        self.clear_btn.setToolTip("Clear Chat (Ctrl+Shift+C)")
         self.send_btn.clicked.connect(self._send)
         self.mic_btn.clicked.connect(self._toggle_speech_input)
         self.dry_run_btn.clicked.connect(self._send_dry_run)
@@ -119,6 +127,8 @@ class PanelDispatchMixin:
         self.chat_model_combo.currentIndexChanged.connect(self._on_chat_model_changed)
         self.vision_model_combo.currentIndexChanged.connect(self._on_vision_model_changed)
         self.settings_panel.settings_changed.connect(self._apply_settings)
+        if hasattr(self.settings_panel, "doctor_requested"):
+            self.settings_panel.doctor_requested.connect(self._run_doctor)
         self.quick_bar.prompt_selected.connect(self._apply_quick_prompt)
         self.empty_state.prompt_selected.connect(self._apply_quick_prompt)
         self.conn_status.reconnect_requested.connect(self._refresh_models_async)
@@ -142,7 +152,53 @@ class PanelDispatchMixin:
         self.autoresearch_action.triggered.connect(self._toggle_autoresearch)
         self.autoresearch_stats_action.triggered.connect(self._show_autoresearch_stats)
         self.sig_autoresearch_progress.connect(self._on_autoresearch_progress)
+
+        self.settings_panel.mcp_toggle_btn.clicked.connect(self._on_mcp_toggle)
+
+        # Update MCP UI status every 2 seconds
+        self._mcp_status_timer = QtCore.QTimer(self)
+        self._mcp_status_timer.setInterval(2000)
+        self._mcp_status_timer.timeout.connect(self._update_mcp_ui_status)
+        self._mcp_status_timer.start()
+        self._update_mcp_ui_status()
+
+        if hasattr(self, "workspace_splitter"):
+            self.workspace_splitter.splitterMoved.connect(
+                lambda *_args: self._queue_panel_state_save()
+            )
+        if hasattr(self, "inspector_tabs"):
+            self.inspector_tabs.currentChanged.connect(
+                lambda *_args: self._queue_panel_state_save()
+            )
+        for btn_name in (
+            "details_toggle_btn",
+            "settings_toggle_btn",
+            "vision_toggle_btn",
+            "fast_toggle_btn",
+        ):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.toggled.connect(lambda *_args: self._queue_panel_state_save())
+
+        self._setup_shortcuts()
         self.input_box.installEventFilter(self)
+
+    def _setup_shortcuts(self):
+        shortcuts = [
+            ("Ctrl+Return", self._send),
+            ("Ctrl+Enter", self._send),
+            ("Esc", lambda: self._on_stop() if self._busy else None),
+            ("Ctrl+Shift+S", self._inject_scene),
+            ("Ctrl+I", self._inspect_network_view),
+            ("Ctrl+Shift+C", self._clear_conversation),
+            ("Ctrl+Shift+R", self._refresh_models_async),
+        ]
+        self._shortcuts = []
+        for sequence, callback in shortcuts:
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
+            shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
 
     def _toggle_speech_input(self):
         controller = getattr(self, "_asr_controller", None)
@@ -505,12 +561,23 @@ class PanelDispatchMixin:
     def _run_doctor(self):
         """Quick health-check: Ollama reachable, vision model, RAG, memory DB."""
         lines = ["**HoudiniMind Doctor**\n"]
+        startup_issues = getattr(self, "_startup_issues", []) or []
+        if startup_issues:
+            lines.append(f"⚠️ Startup: {len(startup_issues)} issue(s)")
+            for issue in startup_issues[:4]:
+                lines.append(f"  - {issue.get('subsystem', 'Startup')}: {issue.get('error', '')}")
+        else:
+            lines.append("✅ Startup: no recorded init issues")
+        backend = str(self.config.get("backend", "ollama") or "ollama").lower()
+        lines.append(f"Backend: **{'NVIDIA NIM' if backend == 'nvidia' else 'Ollama'}**")
         # Ollama connectivity
         try:
-            models = self.agent.llm.list_models() if self.agent else []
-            lines.append(f"✅ Ollama: reachable — {len(models)} model(s) loaded")
+            if not self.agent:
+                raise RuntimeError("agent is not initialized")
+            models = self.agent.llm.list_models()
+            lines.append(f"✅ Models: reachable — {len(models)} model(s) loaded")
         except Exception as e:
-            lines.append(f"❌ Ollama: unreachable — {e}")
+            lines.append(f"❌ Models: unreachable — {e}")
         # Chat model
         if self.agent:
             m = getattr(self.agent.llm, "model", "?")
@@ -1063,6 +1130,11 @@ class PanelDispatchMixin:
                 runner=runner,
                 stream_callback=self.sig_stream_chunk.emit,
                 done_callback=self.sig_response_done.emit,
+                meta={
+                    "user_text": getattr(self, "_last_user_request", ""),
+                    "mode": getattr(self, "_current_mode", kind),
+                    "dry_run": bool(getattr(self, "_current_dry_run", False)),
+                },
             )
             return
         threading.Thread(
@@ -1164,6 +1236,53 @@ class PanelDispatchMixin:
             return
         self._append_live_text_to_bubble(normalized)
 
+    @staticmethod
+    def _format_llm_trace_entry(
+        round_num: int,
+        task: str,
+        content: str,
+        tool_names: list[str],
+        tool_call_count: int,
+    ) -> str:
+        title = f"Round {round_num} - {task}"
+        if tool_call_count:
+            title += f" - {tool_call_count} tool call{'s' if tool_call_count != 1 else ''}"
+        lines = [title]
+        if content:
+            lines.append(content.strip())
+        if tool_names:
+            lines.append("Tools: " + ", ".join(tool_names))
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _compact_activity_text(text: str) -> str:
+        """Normalize non-LLM activity rows for Houdini Qt text rendering."""
+        cleaned = str(text or "").replace("\u200b", "").strip()
+        if not cleaned:
+            return ""
+        replacements = {
+            "🔧": "[tool]",
+            "✅": "[ok]",
+            "❌": "[error]",
+            "⚠️": "[warn]",
+            "⚠": "[warn]",
+            "⏳": "[retry]",
+            "🧪": "[dry-run]",
+            "👁️": "[vision]",
+            "👁": "[vision]",
+            "🔍": "[check]",
+            "🕸️": "[network]",
+            "🕸": "[network]",
+            "📋": "[plan]",
+            "💾": "[save]",
+            "🔁": "[retry]",
+            "→": "->",
+        }
+        for src, dst in replacements.items():
+            cleaned = cleaned.replace(src, dst)
+        lines = [" ".join(line.split()) for line in cleaned.splitlines()]
+        return "\n".join(line for line in lines if line)
+
     def _on_chunk(self, chunk: str):
         research_sentinel = "\x00RESEARCH_OPTIONS\x00"
         progress_sentinel = "\x00AGENT_PROGRESS\x00"
@@ -1190,16 +1309,19 @@ class PanelDispatchMixin:
             tool_names = [str(n) for n in (data.get("tool_names") or []) if str(n)]
             content = str(data.get("content", "") or "").strip()
             if content or tool_names:
-                if content:
-                    summary = f"R{round_num} [{task}] tc={tool_call_count}: {content[:240]}"
-                else:
-                    names = ", ".join(tool_names[:5])
-                    summary = f"R{round_num} [{task}] selected tool call{'s' if tool_call_count != 1 else ''}: {names}"
-                if summary not in self._current_turn_llm_notes:
-                    self._current_turn_llm_notes.append(summary)
-                self.thought_label.setText(summary)
+                trace_entry = self._format_llm_trace_entry(
+                    round_num,
+                    task,
+                    content,
+                    tool_names,
+                    tool_call_count,
+                )
+                if trace_entry not in self._current_turn_llm_notes:
+                    self._current_turn_llm_notes.append(trace_entry)
+                status_line = trace_entry.splitlines()[0]
+                self.thought_label.setText(status_line)
                 if self._current_bubble and hasattr(self._current_bubble, "set_llm_activity"):
-                    self._current_bubble.set_llm_activity(summary)
+                    self._current_bubble.set_llm_activity(trace_entry)
             return
         if chunk.startswith(progress_sentinel):
             progress_text = chunk.split(progress_sentinel, 1)[1]
@@ -1218,8 +1340,7 @@ class PanelDispatchMixin:
             # create_node → UNDO_TRACK ..." text and the giant gaps inside
             # the bubble.  Surface them only via the thought/debug label;
             # the dedicated Tools panel already shows full tool history.
-            live_chunk = chunk.replace("\u200b", "")
-            live_text = live_chunk.strip()
+            live_text = self._compact_activity_text(chunk)
             if live_text:
                 self.thought_label.setText(live_text)
                 if self._current_bubble and hasattr(self._current_bubble, "set_llm_activity"):
@@ -1325,9 +1446,10 @@ class PanelDispatchMixin:
         self._hide_status()
         self._set_busy(False)
         self._clear_phase_anim()  # after busy=False so chip refresh sees idle
-        # Keep turn strip visible after turn ends so user can see the summary
+        # Legacy turn strip is intentionally hidden; summary lives in the bubble
+        # and inspector.
         if hasattr(self, "turn_strip"):
-            self.turn_strip.setVisible(True)
+            self.turn_strip.setVisible(False)
         result_text = (result or "").strip()
         self._last_result_text = result_text
         self._last_turn_tools = list(self._current_turn_tools)
@@ -1365,8 +1487,10 @@ class PanelDispatchMixin:
                 failures=self._last_turn_failures,
                 dry_run=bool(self.agent and getattr(self.agent, "_last_turn_dry_run", False)),
             )
-            if self._last_turn_llm_notes and self.config.get("ui", {}).get(
-                "show_llm_trace_history", True
+            if (
+                self._last_turn_llm_notes
+                and not hasattr(self._current_bubble, "set_llm_activity")
+                and self.config.get("ui", {}).get("show_llm_trace_history", True)
             ):
                 trace_block = "### LLM Trace\n" + "\n".join(
                     f"- {line}" for line in self._last_turn_llm_notes[:12]
@@ -1395,9 +1519,12 @@ class PanelDispatchMixin:
                     f"QFrame {{ background: #1a0e0e; border-radius: 0px; "
                     f"border-left: 2px solid {_MS.ACCENT_DANGER}; border-top: none; border-right: none; border-bottom: none; }}"
                 )
-            if hasattr(self._current_bubble, "clear_llm_activity"):
-                self._current_bubble.clear_llm_activity()
             self._current_bubble.set_text(display_text)
+            self._add_turn_summary_widget(
+                self._last_turn_tools,
+                self._last_turn_outputs,
+                self._last_turn_failures,
+            )
             # Embed final viewport snapshot inline if the agent captured one
             if self.agent:
                 # Viewport screenshot embedding removed — user can see viewport in Houdini directly
@@ -1447,6 +1574,61 @@ class PanelDispatchMixin:
             self.composer_autoresearch_action.setChecked(
                 bool(getattr(self, "_autoresearch_running", False))
             )
+
+    @staticmethod
+    def _turn_summary_counts(tools: list) -> tuple[int, int]:
+        created = 0
+        updated = 0
+        for entry in tools or []:
+            name = str((entry or {}).get("name") or "")
+            result = (entry or {}).get("result") or {}
+            if result.get("status") == "error":
+                continue
+            args = (entry or {}).get("args") or {}
+            data = result.get("data") or {}
+            if name == "create_node":
+                created += 1
+            elif name == "create_node_chain":
+                created += int(data.get("count") or len(args.get("chain") or []) or 0)
+            elif name in {
+                "set_parameter",
+                "safe_set_parameter",
+                "set_expression",
+                "connect_nodes",
+                "set_display_flag",
+                "rename_node",
+                "delete_node",
+                "finalize_sop_network",
+            }:
+                updated += 1
+        return created, updated
+
+    def _add_turn_summary_widget(self, tools: list, outputs: list, failures: list) -> None:
+        if self._current_bubble is None:
+            return
+        created, updated = self._turn_summary_counts(tools)
+        output = self._preferred_output_path(outputs)
+        warnings = len(failures or [])
+        if created == 0 and updated == 0 and not output and warnings == 0:
+            return
+        summary = TurnSummaryWidget(
+            created=created,
+            updated=updated,
+            output=output,
+            warnings=warnings,
+            parent=self.messages_w,
+        )
+        summary.details_requested.connect(self._show_result_scene_details)
+        summary.tools_requested.connect(self._show_result_tool_trace)
+        insert_index = self.messages_l.indexOf(self._current_bubble)
+        if insert_index < 0:
+            insert_index = self._message_insert_index() - 1
+        self.messages_l.insertWidget(
+            insert_index + 1,
+            summary,
+            0,
+            QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop,
+        )
 
     def _humanize_final_response(
         self,
@@ -1726,3 +1908,33 @@ class PanelDispatchMixin:
         self._dispatch_research(
             f"Fix this error on {node_path}:\n{error_msg}\n\nInvestigate and execute the solution to fix this issue."
         )
+
+    def _on_mcp_toggle(self):
+        port = self.settings_panel.mcp_port_spin.value()
+        msg = mcp_houdini_server.toggle_server(port=port)
+        self._update_mcp_ui_status()
+        if msg:
+            print(f"HoudiniMind MCP: {msg}")
+
+    def _update_mcp_ui_status(self):
+        if not hasattr(self, "settings_panel") or not hasattr(
+            self.settings_panel, "mcp_status_indicator"
+        ):
+            return
+        running = mcp_houdini_server.is_server_running()
+        if running:
+            self.settings_panel.mcp_status_indicator.setText("● Running")
+            self.settings_panel.mcp_status_indicator.setStyleSheet(
+                f"color: {ModernStyles.ACCENT_SUCCESS}; font-size: 11px; font-weight: 600;"
+            )
+            self.settings_panel.mcp_toggle_btn.setText("Stop Server")
+            self.settings_panel.mcp_toggle_btn.setStyleSheet(
+                f"background: #3a2424; color: {ModernStyles.ACCENT_DANGER}; border: 1px solid {ModernStyles.ACCENT_DANGER}44;"
+            )
+        else:
+            self.settings_panel.mcp_status_indicator.setText("● Stopped")
+            self.settings_panel.mcp_status_indicator.setStyleSheet(
+                f"color: {ModernStyles.TEXT_DIM}; font-size: 11px; font-weight: 600;"
+            )
+            self.settings_panel.mcp_toggle_btn.setText("Start Server")
+            self.settings_panel.mcp_toggle_btn.setStyleSheet("")

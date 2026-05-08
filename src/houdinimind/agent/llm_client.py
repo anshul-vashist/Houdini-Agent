@@ -22,6 +22,7 @@ import io
 import json
 import math
 import os
+import ssl
 import threading
 import time
 import urllib.error
@@ -43,6 +44,7 @@ from .tool_selection import (
 )
 
 OLLAMA_BASE = "http://localhost:11434"
+NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 
 
 class RequestCancelledError(ConnectionError):
@@ -177,6 +179,10 @@ def chars_per_token_for_model(model_name: str) -> float:
         return 3.1
     if "mistral" in lowered:
         return 3.1
+    if any(name in lowered for name in ("gemma", "gemini")):
+        return 3.3
+    if any(name in lowered for name in ("gpt", "claude", "phi")):
+        return 3.5
     return 3.5
 
 
@@ -202,13 +208,35 @@ class OllamaClient:
 
     def apply_runtime_config(self, config: dict):
         self.config = dict(config or {})
-        self.model = self.config.get("model", "qwen2.5-coder:32b")
-        self.vision_model = self.config.get("vision_model", "llava:13b")
+        # No model-family default. The shipped core_config.json supplies the
+        # actual default; if a config is missing the chosen model, the user
+        # picks one in Settings rather than getting silently routed to a
+        # specific family.
+        self.model = self.config.get("model", "") or ""
+        self.vision_model = self.config.get("vision_model", "") or ""
         self.vision_enabled = self.config.get("vision_enabled", True)
         self.embed_model = self.config.get("embed_model", "nomic-embed-text")
-        self.base_url = self.config.get("ollama_url", OLLAMA_BASE).rstrip("/")
+        self.backend_name = str(self.config.get("backend", "ollama") or "ollama").strip().lower()
+        if self.backend_name == "nvidia":
+            self.base_url = self.config.get("openai_base_url", NVIDIA_BASE).rstrip("/")
+        else:
+            self.base_url = self.config.get("ollama_url", OLLAMA_BASE).rstrip("/")
         self.temperature = self.config.get("temperature", 0.3)
-        self.api_key = self.config.get("api_key", "").strip()
+        # SECURITY: resolve API key from secure credential store first,
+        # then fall back to plaintext config for backward compatibility.
+        _config_api_key = self.config.get("api_key", "").strip()
+        try:
+            from .credential_store import CredentialStore
+
+            _cred_store = CredentialStore(self.config.get("data_dir", ""))
+            _secure_key = _cred_store.get_api_key()
+            self.api_key = _secure_key or _config_api_key
+            # Migrate: if we found a plaintext key in config but not in the
+            # secure store, save it there now and clear the config copy.
+            if _config_api_key and not _secure_key:
+                _cred_store.save_api_key(_config_api_key)
+        except Exception:
+            self.api_key = _config_api_key
         # CRIT-10: resolving the context window issues a /api/show request with
         # a 10s timeout. Running it inside __init__ froze Houdini on panel load
         # whenever Ollama was down. Defer it — first consumer triggers lookup.
@@ -226,8 +254,13 @@ class OllamaClient:
             1.0,
             float(self.config.get("rate_limit_cooldown_s", 15.0)),
         )
+        # Wall-clock cap on the retry chain. Prevents naive exponential backoff
+        # 0 disables the wall-clock cap on the retry chain entirely.
+        self.max_retry_time_s = max(
+            0.0,
+            float(self.config.get("max_retry_time_s", 0.0)),
+        )
 
-        self.backend_name = str(self.config.get("backend", "ollama") or "ollama").strip().lower()
         self._embed_cache = _BoundedEmbedCache(
             max_entries=int(self.config.get("embed_cache_size", 2048))
         )
@@ -331,6 +364,22 @@ class OllamaClient:
             )
         return self.model
 
+    def _fallback_model_after_access_error(self, failing_model: str) -> str | None:
+        fallback_model = self.model if self.model and self.model != failing_model else None
+        if fallback_model:
+            return fallback_model
+
+        try:
+            available = [m for m in self.list_models() if m and m != failing_model]
+        except Exception:
+            available = []
+        if not available:
+            return None
+        if ":cloud" in failing_model.lower():
+            local_models = [m for m in available if ":cloud" not in m.lower()]
+            return (local_models or available)[0]
+        return available[0]
+
     # ------------------------------------------------------------------
     # Structured vision chat (system + user + image)
     # ------------------------------------------------------------------
@@ -389,13 +438,14 @@ class OllamaClient:
             raise ConnectionError(f"Vision request failed: {e}")
 
     def _rate_limit_error_message(self) -> str:
+        backend = "NVIDIA NIM" if self.backend_name == "nvidia" else "Ollama"
         remaining = max(0.0, self._rate_limited_until - time.time())
         if remaining >= 1.0:
             return (
-                "Ollama is overloaded (429). "
+                f"{backend} is overloaded (429). "
                 f"Please wait about {math.ceil(remaining)}s before retrying."
             )
-        return "Ollama is overloaded (429). Please wait a moment and retry."
+        return f"{backend} is overloaded (429). Please wait a moment and retry."
 
     def _retry_delay_for_http_error(self, error: urllib.error.HTTPError, attempt: int) -> float:
         retry_after = None
@@ -427,6 +477,9 @@ class OllamaClient:
         retries = retries or self.request_retries
         if time.time() < self._rate_limited_until:
             raise ConnectionError(self._rate_limit_error_message())
+        retry_deadline = (
+            time.monotonic() + self.max_retry_time_s if self.max_retry_time_s > 0 else None
+        )
         for attempt in range(retries):
             try:
                 return req_fn()
@@ -447,6 +500,11 @@ class OllamaClient:
                     # Exponential backoff for server errors; honour the rate-limit window for 429
                     if e.code == 429:
                         delay = max(delay, min(self.rate_limit_cooldown_s, 60.0))
+                    if retry_deadline is not None:
+                        remaining = retry_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise
+                        delay = min(delay, max(0.1, remaining))
                     if self.debug_logger:
                         self.debug_logger.log_llm_retry(
                             attempt=attempt + 1,
@@ -464,6 +522,11 @@ class OllamaClient:
                 if attempt == retries - 1:
                     raise
                 delay = 2 ** (attempt + 1)
+                if retry_deadline is not None:
+                    remaining = retry_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    delay = min(delay, max(0.1, remaining))
                 if self.debug_logger:
                     self.debug_logger.log_llm_retry(
                         attempt=attempt + 1,
@@ -472,7 +535,7 @@ class OllamaClient:
                         delay_s=delay,
                         model=getattr(self, "model", None),
                     )
-                # Standard exponential backoff: 2, 4, 8, 16s
+                # Standard exponential backoff: 2, 4, 8, 16s (capped by retry_deadline)
                 time.sleep(delay)
 
     def _base_parts(self):
@@ -483,13 +546,80 @@ class OllamaClient:
         base_path = parsed.path.rstrip("/")
         return scheme, host, port, base_path
 
-    def _open_connection(self, timeout: int):
+    def _ssl_context(self, *, insecure: bool = False):
+        if insecure:
+            return ssl._create_unverified_context()
+        try:
+            import certifi
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl.create_default_context()
+
+    def _open_connection(self, *, timeout: int | float | None = None, insecure_ssl: bool = False):
+        """Open an HTTP(S) connection.
+
+        For LLM streaming calls (no explicit timeout): uses connect_timeout_s
+        from config (default 30s) covering only the TCP handshake + request
+        send. After conn.request() the caller must call _release_connect_timeout
+        before conn.getresponse() so the server can take as long as it needs.
+
+        For short utility calls (embeddings, tags, /api/show): pass an explicit
+        timeout so those requests still fail fast on unresponsive servers.
+        """
+        connect_timeout = (
+            timeout if timeout is not None else float(self.config.get("connect_timeout_s", 30.0))
+        )
         scheme, host, port, _ = self._base_parts()
-        conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        conn = conn_cls(host, port, timeout=timeout)
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(
+                host,
+                port,
+                timeout=connect_timeout,
+                context=self._ssl_context(insecure=insecure_ssl),
+            )
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=connect_timeout)
         with self._connection_lock:
             self._active_connections.add(conn)
         return conn
+
+    def _release_connect_timeout(self, conn) -> None:
+        """Remove the connect timeout after the request is sent.
+
+        connect_timeout_s covers the TCP handshake + sending the HTTP request.
+        Once conn.request() returns we know the server is reachable and has
+        received the prompt. The server now needs unbounded time to process it
+        before it sends the first HTTP header back (conn.getresponse() blocks
+        here). Keeping the connect timeout active would abort that wait — so we
+        clear it to None (blocking with no deadline).
+        """
+        try:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                sock.settimeout(None)
+        except Exception:
+            pass
+
+    def _arm_silence_detection(self, conn) -> float:
+        """Switch the live socket to the per-read silence window.
+
+        Called immediately after getresponse() so every subsequent read() call
+        has a per-read deadline equal to stream_silence_s (default 60s). If no
+        bytes arrive within that window the read raises socket.timeout, which we
+        catch and convert to a retryable ConnectionError.
+
+        Returns the silence window in seconds so callers can include it in error
+        messages.
+        """
+        silence_s = float(self.config.get("stream_silence_s", 60.0))
+        try:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                sock.settimeout(silence_s)
+        except Exception:
+            pass
+        return silence_s
 
     def _close_connection(self, conn):
         with self._connection_lock:
@@ -525,7 +655,7 @@ class OllamaClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        conn = self._open_connection(timeout)
+        conn = self._open_connection(timeout=timeout)
         try:
             conn.request(method, full_path, body=body, headers=headers)
             response = conn.getresponse()
@@ -554,7 +684,7 @@ class OllamaClient:
         messages: list,
         tools: list | None = None,
         model_override: str | None = None,
-        timeout_s: int = 300,
+        timeout_s: int | None = None,
         chunk_callback=None,
     ) -> dict:
         """
@@ -582,10 +712,12 @@ class OllamaClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         # _open_connection already registers in _active_connections
-        conn = self._open_connection(timeout_s)
-        started_at = time.time()
+        conn = self._open_connection()
         try:
             conn.request("POST", full_path, body=body, headers=headers)
+            # TCP connect + request send is done. Release the connect timeout so
+            # getresponse() can wait as long as the server needs to start replying.
+            self._release_connect_timeout(conn)
             response = conn.getresponse()
             if response.status >= 400:
                 raw = response.read()
@@ -597,18 +729,28 @@ class OllamaClient:
                     io.BytesIO(raw),
                 )
 
+            # Switch from connect timeout to per-read silence window now that
+            # the server has responded. The LLM can take as long as it needs as
+            # long as it keeps sending tokens.
+            silence_s = self._arm_silence_detection(conn)
+
             # Read streamed NDJSON lines — check cancel before every chunk
             content_parts = []
             tool_calls_final = []
             last_chunk = {}
             buf = b""
             while True:
-                if timeout_s and (time.time() - started_at) > float(timeout_s):
-                    raise TimeoutError(f"LLM request exceeded timeout ({timeout_s}s).")
                 if self._cancel_requests.is_set():
                     raise RequestCancelledError("Request cancelled by user.")
                 try:
                     chunk = response.read(4096)
+                except (TimeoutError, OSError) as _te:
+                    if self._cancel_requests.is_set():
+                        raise RequestCancelledError("Request cancelled by user.")
+                    raise ConnectionError(
+                        f"LLM stream went silent for {silence_s:.0f}s with no data. "
+                        "The connection likely dropped mid-generation."
+                    ) from _te
                 except Exception:
                     if self._cancel_requests.is_set():
                         raise RequestCancelledError("Request cancelled by user.")
@@ -617,8 +759,6 @@ class OllamaClient:
                     break
                 buf += chunk
                 while b"\n" in buf:
-                    if timeout_s and (time.time() - started_at) > float(timeout_s):
-                        raise TimeoutError(f"LLM request exceeded timeout ({timeout_s}s).")
                     line, buf = buf.split(b"\n", 1)
                     line = line.strip()
                     if not line:
@@ -668,6 +808,223 @@ class OllamaClient:
             assembled["tool_calls"] = tool_calls_final
         return assembled
 
+    def _openai_compatible_path(self, suffix: str) -> str:
+        _, _, _, base_path = self._base_parts()
+        return f"{base_path}{suffix}"
+
+    def _normalise_openai_messages(self, messages: list) -> list:
+        # NVIDIA NIM (and some other OpenAI-compatible APIs) require ALL system
+        # messages to appear at the very beginning of the conversation. The agent
+        # loop injects context system messages mid-list (e.g. mode guidance, task
+        # anchor, plan injection) which causes HTTP 400 "System message must be at
+        # the beginning." Hoist every system message to the front and merge them
+        # into a single entry so the constraint is always satisfied.
+        system_parts: list[str] = []
+        non_system: list[dict] = []
+        for msg in messages or []:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                text = content if isinstance(content, str) else json.dumps(content)
+                if text.strip():
+                    system_parts.append(text.strip())
+                continue
+            if role == "tool":
+                item = {
+                    "role": "tool" if msg.get("tool_call_id") else "user",
+                    "content": content if isinstance(content, str) else json.dumps(content),
+                }
+                if msg.get("tool_call_id"):
+                    item["tool_call_id"] = msg["tool_call_id"]
+                else:
+                    item["content"] = f"Tool result:\n{item['content']}"
+                non_system.append(item)
+                continue
+            item = {"role": role, "content": content}
+            if msg.get("tool_calls"):
+                item["tool_calls"] = msg["tool_calls"]
+            non_system.append(item)
+
+        normalised: list[dict] = []
+        if system_parts:
+            normalised.append({"role": "system", "content": "\n\n".join(system_parts)})
+        normalised.extend(non_system)
+        return normalised
+
+    def _openai_compatible_chat(
+        self,
+        messages: list,
+        tools: list | None = None,
+        model_override: str | None = None,
+        timeout_s: int | None = None,
+        chunk_callback=None,
+    ) -> dict:
+        if not self.api_key:
+            raise ConnectionError("NVIDIA NIM API key is missing. Add it in Settings → API key.")
+
+        payload = {
+            "model": model_override or self.model,
+            "messages": self._normalise_openai_messages(messages),
+            "temperature": self.temperature,
+            "top_p": float(self.config.get("top_p", 0.95)),
+            "max_tokens": int(
+                self.config.get("max_tokens", min(self._context_window_config, 16384))
+            ),
+            "stream": True,
+        }
+        # `openai_extra_body` lets the user pass model-specific options
+        # (e.g. Qwen3's `chat_template_kwargs.thinking=False` or DeepSeek's
+        # reasoning toggles) without baking any single family's flags into
+        # the default request. Empty by default so all NIM models behave the
+        # same out of the box.
+        extra_body = self.config.get("openai_extra_body") or {}
+        if isinstance(extra_body, dict) and extra_body:
+            payload.update(extra_body)
+        if tools:
+            payload["tools"] = tools
+
+        self._cancel_requests.clear()
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        started_at = time.time()
+        allow_ssl_fallback = bool(self.config.get("ssl_verify_fallback", True))
+        insecure_attempts = [False, True] if allow_ssl_fallback else [False]
+        last_ssl_error = None
+        for insecure_ssl in insecure_attempts:
+            conn = self._open_connection(insecure_ssl=insecure_ssl)
+            try:
+                return self._openai_compatible_chat_on_connection(
+                    conn,
+                    body,
+                    headers,
+                    payload,
+                    started_at,
+                    chunk_callback,
+                )
+            except ssl.SSLCertVerificationError as exc:
+                last_ssl_error = exc
+                if not allow_ssl_fallback or insecure_ssl:
+                    raise
+            finally:
+                self._close_connection(conn)
+        raise ConnectionError(f"SSL certificate verification failed: {last_ssl_error}")
+
+    def _openai_compatible_chat_on_connection(
+        self,
+        conn,
+        body: bytes,
+        headers: dict,
+        payload: dict,
+        started_at: float,
+        chunk_callback=None,
+    ) -> dict:
+        try:
+            conn.request(
+                "POST",
+                self._openai_compatible_path("/chat/completions"),
+                body=body,
+                headers=headers,
+            )
+            # TCP connect + request send is done. Release the connect timeout so
+            # getresponse() can wait as long as the server needs to start replying.
+            self._release_connect_timeout(conn)
+            response = conn.getresponse()
+            if response.status >= 400:
+                raw = response.read()
+                raise urllib.error.HTTPError(
+                    f"{self.base_url}/chat/completions",
+                    response.status,
+                    response.reason,
+                    response.headers,
+                    io.BytesIO(raw),
+                )
+
+            silence_s = self._arm_silence_detection(conn)
+
+            content_parts: list[str] = []
+            tool_calls_by_index: dict[int, dict] = {}
+            last_chunk: dict = {}
+            buf = b""
+            while True:
+                if self._cancel_requests.is_set():
+                    raise RequestCancelledError("Request cancelled by user.")
+                try:
+                    chunk = response.read(4096)
+                except (TimeoutError, OSError) as _te:
+                    if self._cancel_requests.is_set():
+                        raise RequestCancelledError("Request cancelled by user.")
+                    raise ConnectionError(
+                        f"LLM stream went silent for {silence_s:.0f}s with no data. "
+                        "The connection likely dropped mid-generation."
+                    ) from _te
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith(b"data:"):
+                        line = line[5:].strip()
+                    if line == b"[DONE]":
+                        buf = b""
+                        break
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    last_chunk = data
+                    for choice in data.get("choices", []) or []:
+                        delta = choice.get("delta") or {}
+                        part = delta.get("content")
+                        if part:
+                            content_parts.append(part)
+                            if chunk_callback is not None:
+                                try:
+                                    chunk_callback(part)
+                                except Exception:
+                                    pass
+                        for tc in delta.get("tool_calls") or []:
+                            index = int(tc.get("index", len(tool_calls_by_index)))
+                            existing = tool_calls_by_index.setdefault(
+                                index,
+                                {
+                                    "id": tc.get("id", ""),
+                                    "type": tc.get("type", "function"),
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if tc.get("id"):
+                                existing["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                existing["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                existing["function"]["arguments"] += fn["arguments"]
+
+            usage = last_chunk.get("usage") if isinstance(last_chunk, dict) else None
+            self._last_token_usage = {
+                "tokens_in": (usage or {}).get("prompt_tokens"),
+                "tokens_out": (usage or {}).get("completion_tokens"),
+                "total_duration_ms": int((time.time() - started_at) * 1000),
+                "model": payload.get("model"),
+            }
+            assembled = {"role": "assistant", "content": "".join(content_parts)}
+            tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+            if tool_calls:
+                assembled["tool_calls"] = tool_calls
+            return assembled
+        except RequestCancelledError:
+            raise
+        except Exception:
+            if self._cancel_requests.is_set():
+                raise RequestCancelledError("Request cancelled by user.")
+            raise
+
     def _chat_via_ollama(
         self,
         messages: list,
@@ -706,22 +1063,10 @@ class OllamaClient:
                 pass
 
             if e.code in (404, 403, 401):
-                # Try to find a local fallback if the cloud model failed
-                fallback_model = self.model
-                if ":cloud" in model.lower():
-                    # If current is cloud, try self.model if it's different,
-                    # otherwise try to find any local model from the list.
-                    if fallback_model == model:
-                        available = self.list_models()
-                        local_models = [m for m in available if ":cloud" not in m.lower()]
-                        if local_models:
-                            # Prioritize the user's requested high-quality cloud fallback
-                            if model != "qwen3.5:397b-cloud":
-                                fallback_model = "qwen3.5:397b-cloud"
-                            else:
-                                # Only fallback to local qwen models if the cloud one is the one failing
-                                qwen_models = [m for m in local_models if "qwen" in m.lower()]
-                                fallback_model = qwen_models[0] if qwen_models else None
+                # Pick a fallback model that is NOT model-family-specific.
+                # Priority: the user-configured chat model if it differs from
+                # the failing model, then any other model Ollama reports.
+                fallback_model = self._fallback_model_after_access_error(model)
 
                 if fallback_model and model != fallback_model:
                     try:
@@ -764,6 +1109,58 @@ class OllamaClient:
         except Exception as e:
             raise ConnectionError(f"Cannot reach Ollama at {self.base_url}. {e}")
 
+    def _chat_via_openai_compatible(
+        self,
+        messages: list,
+        tools: list | None = None,
+        task: str | None = None,
+        model_override: str | None = None,
+        timeout_s: float | None = None,
+        chunk_callback=None,
+    ) -> dict:
+        model = self._get_model_for(task)
+        if model_override and self.debug_logger:
+            self.debug_logger.log_system_note(
+                f"Ignoring model_override='{model_override}' in favor of UI-selected model '{model}'."
+            )
+
+        def _do():
+            kwargs = {"model_override": model}
+            if timeout_s is not None:
+                kwargs["timeout_s"] = int(timeout_s)
+            if chunk_callback is not None:
+                kwargs["chunk_callback"] = chunk_callback
+            return self._openai_compatible_chat(messages, tools, **kwargs)
+
+        try:
+            return self._request_with_retry(_do)
+        except RequestCancelledError:
+            raise
+        except urllib.error.HTTPError as e:
+            body_msg = ""
+            try:
+                if hasattr(e, "fp") and e.fp:
+                    body_msg = f" | Body: {e.fp.read().decode('utf-8')[:300]}"
+            except Exception:
+                pass
+            if e.code in (401, 403):
+                raise ConnectionError(
+                    f"HTTP {e.code}: NVIDIA API access denied for '{model}'. Check the API key in Settings.{body_msg}"
+                )
+            if e.code == 404:
+                raise ConnectionError(f"Model '{model}' was not found by the NVIDIA API.{body_msg}")
+            if e.code == 429:
+                self._rate_limited_until = max(
+                    self._rate_limited_until,
+                    time.time() + self.rate_limit_cooldown_s,
+                )
+                raise ConnectionError(self._rate_limit_error_message())
+            raise ConnectionError(f"NVIDIA API HTTP {e.code}: {e.reason}{body_msg}")
+        except ConnectionError:
+            raise
+        except Exception as e:
+            raise ConnectionError(f"Cannot reach NVIDIA API at {self.base_url}. {e}")
+
     # ------------------------------------------------------------------
     # Unified chat dispatch
     # ------------------------------------------------------------------
@@ -776,6 +1173,15 @@ class OllamaClient:
         timeout_s: float | None = None,
         chunk_callback=None,
     ) -> dict:
+        if self.backend_name == "nvidia":
+            return self._chat_via_openai_compatible(
+                messages,
+                tools=tools,
+                task=task,
+                model_override=model_override,
+                timeout_s=timeout_s,
+                chunk_callback=chunk_callback,
+            )
         return self._chat_via_ollama(
             messages,
             tools=tools,
@@ -852,6 +1258,22 @@ class OllamaClient:
     def chat_simple(
         self, system: str, user: str, temperature: float | None = None, task: str = "research"
     ) -> str:
+        if self.backend_name == "nvidia":
+            old_temp = self.temperature
+            if temperature is not None:
+                self.temperature = temperature
+            try:
+                msg = self._chat_via_openai_compatible(
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    tools=None,
+                    task=task,
+                )
+                return msg.get("content", "")
+            finally:
+                self.temperature = old_temp
         return self._chat_simple_via_ollama(system, user, temperature=temperature, task=task)
 
     def _chat_simple_via_ollama(
@@ -887,7 +1309,7 @@ class OllamaClient:
                 method="POST",
             )
             parts: list[str] = []
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=None) as resp:
                 for line in resp:
                     if not line or not line.strip():
                         continue
@@ -906,19 +1328,35 @@ class OllamaClient:
             return self._request_with_retry(lambda: _do(model))
         except RequestCancelledError:
             raise
-        except urllib.error.URLError as e:
-            if hasattr(e, "code") and e.code == 404:
-                fallback_model = self.model
+        except urllib.error.HTTPError as e:
+            body_msg = ""
+            try:
+                if hasattr(e, "fp") and e.fp:
+                    body_msg = f" | Body: {e.fp.read().decode('utf-8')[:300]}"
+            except Exception:
+                pass
+
+            if e.code in (401, 403, 404):
+                fallback_model = self._fallback_model_after_access_error(model)
                 if fallback_model and model != fallback_model:
                     if self.debug_logger:
                         self.debug_logger.log_system_note(
-                            f"Model '{model}' unavailable for task '{task}'; "
-                            f"falling back to selected chat model '{fallback_model}'."
+                            f"Model '{model}' failed for task '{task}' "
+                            f"(HTTP {e.code}{body_msg}); trying fallback '{fallback_model}'."
                         )
                     return self._request_with_retry(lambda: _do(fallback_model))
                 raise ConnectionError(
-                    f"Model '{model}' not found in Ollama. Run: ollama pull {model}"
+                    f"Model '{model}' is unavailable for task '{task}' "
+                    f"(HTTP {e.code}{body_msg}). Select an accessible model or update Ollama cloud access."
                 )
+            if e.code == 429:
+                self._rate_limited_until = max(
+                    self._rate_limited_until,
+                    time.time() + self.rate_limit_cooldown_s,
+                )
+                raise ConnectionError(self._rate_limit_error_message())
+            raise ConnectionError(f"LLM HTTP Error {e.code}: {e.reason}{body_msg}")
+        except urllib.error.URLError as e:
             raise ConnectionError(f"LLM error: {e}")
 
     # ------------------------------------------------------------------
@@ -926,6 +1364,20 @@ class OllamaClient:
     # Falls back to urllib for compatibility
     # ------------------------------------------------------------------
     def chat_stream(self, messages: list) -> Generator[str, None, None]:
+        if self.backend_name == "nvidia":
+            parts: list[str] = []
+
+            def _collect(delta: str):
+                parts.append(delta)
+                return None
+
+            try:
+                self._chat_via_openai_compatible(messages, chunk_callback=_collect)
+                yield from parts
+            except Exception as e:
+                yield f"\n[ERROR] NVIDIA streaming error: {e}"
+            return
+
         payload = {
             "model": self.model,
             "messages": messages,
@@ -947,7 +1399,7 @@ class OllamaClient:
                         "Content-Type": "application/json",
                         **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
                     },
-                    timeout=httpx.Timeout(120.0, connect=10.0),
+                    timeout=httpx.Timeout(None, connect=10.0),
                 ) as resp:
                     resp.raise_for_status()
                     for line in resp.iter_lines():
@@ -962,7 +1414,7 @@ class OllamaClient:
                             except json.JSONDecodeError:
                                 continue
             except httpx.TimeoutException:
-                yield "\n[ERROR] Request timed out after 120s."
+                yield "\n[ERROR] Connection timed out."
             except httpx.HTTPStatusError as e:
                 yield f"\n[ERROR] HTTP {e.response.status_code}: {e.response.text[:200]}"
             except Exception as e:
@@ -978,7 +1430,7 @@ class OllamaClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                with urllib.request.urlopen(req, timeout=None) as resp:
                     for line in resp:
                         if line.strip():
                             try:

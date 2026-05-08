@@ -17,6 +17,24 @@ except ImportError:
 
 
 class PanelBackendMixin:
+    def _urlopen_with_ssl_fallback(self, req, timeout: int):
+        import ssl
+        try:
+            import certifi
+            context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            context = ssl.create_default_context()
+        try:
+            import urllib.request
+            return urllib.request.urlopen(req, timeout=timeout, context=context)
+        except ssl.SSLCertVerificationError:
+            import urllib.request
+            return urllib.request.urlopen(
+                req,
+                timeout=timeout,
+                context=ssl._create_unverified_context(),
+            )
+
     def _setup_backend(self):
         try:
             self._config_path = os.path.join(HOUDINIMIND_ROOT, "data", "core_config.json")
@@ -208,20 +226,50 @@ class PanelBackendMixin:
         self.sig_tool_called.emit(tool_name, args, result)
 
     def _refresh_models_async(self):
-        """Fetch available Ollama models in a background thread."""
+        """Fetch available models in a background thread."""
 
         def _fetch():
             try:
                 import urllib.request
 
-                url = self.config.get("ollama_url", "http://localhost:11434")
-                req = urllib.request.Request(f"{url}/api/tags")
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    models = [m["name"] for m in data.get("models", [])]
-                    self.sig_models_loaded.emit(models)
+                backend = str(self.config.get("backend", "ollama") or "ollama").lower()
+                if backend == "nvidia":
+                    url = str(
+                        self.config.get("openai_base_url", "https://integrate.api.nvidia.com/v1")
+                    ).rstrip("/")
+                    headers = {}
+                    # SECURITY: read API key from secure credential store
+                    api_key = ""
+                    try:
+                        from houdinimind.agent.credential_store import CredentialStore
+
+                        api_key = CredentialStore(self.config.get("data_dir", "")).get_api_key()
+                    except Exception:
+                        pass
+                    if not api_key:
+                        api_key = str(self.config.get("api_key", "") or "").strip()
+                    if api_key:
+                        headers["Authorization"] = f"Bearer {api_key}"
+                    req = urllib.request.Request(f"{url}/models", headers=headers)
+                    with self._urlopen_with_ssl_fallback(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+                    if not models:
+                        configured = str(self.config.get("model", "") or "").strip()
+                        models = [configured] if configured else []
+                else:
+                    url = self.config.get("ollama_url", "http://localhost:11434")
+                    req = urllib.request.Request(f"{url}/api/tags")
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        models = [m["name"] for m in data.get("models", [])]
+                self.sig_models_loaded.emit(models)
             except Exception:
-                self.sig_models_loaded.emit([])
+                if str(self.config.get("backend", "ollama") or "ollama").lower() == "nvidia":
+                    configured = str(self.config.get("model", "") or "").strip()
+                    self.sig_models_loaded.emit([configured] if configured else [])
+                else:
+                    self.sig_models_loaded.emit([])
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -294,10 +342,35 @@ class PanelBackendMixin:
     def _apply_settings(self, cfg: dict):
         self.config.update({k: v for k, v in cfg.items() if k not in ("ui",)})
         self.config.setdefault("ui", {}).update(cfg.get("ui", {}))
+        chat_model = self.chat_model_combo.current_model()
+        vision_model = self.vision_model_combo.current_model()
+        if chat_model:
+            self.config["model"] = chat_model
+        if vision_model:
+            self.config["vision_model"] = vision_model
         self.config["auto_backup"] = bool(cfg.get("auto_backup", False))
         self.config["auto_backup_on_save"] = False
         self.config["turn_checkpoints"] = bool(cfg.get("auto_backup", False))
         self.config["vision_enabled"] = True
+
+        raw_api_key = cfg.get("api_key", "").strip()
+        if raw_api_key:
+            try:
+                from houdinimind.agent.credential_store import CredentialStore
+                cred = CredentialStore(self.config.get("data_dir", ""))
+                cred.save_api_key(raw_api_key)
+                self.config["api_key"] = raw_api_key
+            except Exception as e:
+                self.config["api_key"] = raw_api_key
+        else:
+            try:
+                from houdinimind.agent.credential_store import CredentialStore
+                cred = CredentialStore(self.config.get("data_dir", ""))
+                cred.delete_api_key()
+            except Exception:
+                pass
+            self.config["api_key"] = ""
+
         if getattr(self, "_asr_controller", None):
             self._asr_controller.update_config(self.config)
         if self.agent:
@@ -318,8 +391,10 @@ class PanelBackendMixin:
         if not path:
             return
         try:
+            save_config = dict(self.config)
+            save_config["api_key"] = ""
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(save_config, f, indent=2)
         except Exception as e:
             print(f"Config save failed: {e}")
 

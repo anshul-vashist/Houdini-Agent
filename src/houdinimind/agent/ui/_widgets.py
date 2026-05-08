@@ -608,6 +608,8 @@ QUICK_PROMPTS = [
 # ══════════════════════════════════════════════════════════════════════
 
 
+NVIDIA_PLACEHOLDER_MODEL = ""
+
 class ModelCombo(QtWidgets.QComboBox):
     """ComboBox that can be populated from Ollama /api/tags."""
 
@@ -740,6 +742,7 @@ class SettingsPanel(QtWidgets.QFrame):
         # Backend
         self.backend_combo = QtWidgets.QComboBox()
         self.backend_combo.addItem("Ollama", "ollama")
+        self.backend_combo.addItem("NVIDIA NIM", "nvidia")
         backend_value = str(config.get("backend", "ollama") or "ollama").strip().lower()
         backend_index = max(0, self.backend_combo.findData(backend_value))
         self.backend_combo.setCurrentIndex(backend_index)
@@ -780,7 +783,27 @@ class SettingsPanel(QtWidgets.QFrame):
         # Ollama URL
         self.url_edit = QtWidgets.QLineEdit(config.get("ollama_url", "http://localhost:11434"))
         self.url_edit.editingFinished.connect(self._emit)
-        grid.addRow("Ollama URL:", self.url_edit)
+        
+        self.url_label = QtWidgets.QLabel("Ollama URL:")
+        grid.addRow(self.url_label, self.url_edit)
+
+        self.openai_url_label = QtWidgets.QLabel("NVIDIA URL:")
+        self.openai_url_edit = QtWidgets.QLineEdit(
+            str(config.get("openai_base_url", "https://integrate.api.nvidia.com/v1") or "")
+        )
+        self.openai_url_edit.setToolTip("Base URL for NVIDIA NIM backend.")
+        self.openai_url_edit.editingFinished.connect(self._emit)
+        grid.addRow(self.openai_url_label, self.openai_url_edit)
+
+        self.api_key_label = QtWidgets.QLabel("API Key:")
+        self.api_key_edit = QtWidgets.QLineEdit()
+        self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.api_key_edit.setPlaceholderText("Paste NVIDIA API key")
+        
+        api_key = str(config.get("api_key", "") or "")
+        self.api_key_edit.setText(api_key)
+        self.api_key_edit.editingFinished.connect(self._emit)
+        grid.addRow(self.api_key_label, self.api_key_edit)
 
         # Auto-backup
         self.backup_chk = QtWidgets.QCheckBox("Enabled")
@@ -817,7 +840,22 @@ class SettingsPanel(QtWidgets.QFrame):
         self._emit()
 
     def _sync_backend_fields(self):
-        pass
+        is_nvidia = self._current_backend() == "nvidia"
+        if hasattr(self, "url_label"):
+            self.url_label.setVisible(not is_nvidia)
+        self.url_edit.setVisible(not is_nvidia)
+        if hasattr(self, "openai_url_label"):
+            self.openai_url_label.setVisible(is_nvidia)
+            self.openai_url_edit.setVisible(is_nvidia)
+            self.api_key_label.setVisible(is_nvidia)
+            self.api_key_edit.setVisible(is_nvidia)
+        if is_nvidia:
+            chat_model = self.chat_model_combo.current_model()
+            vision_model = self.vision_model_combo.current_model()
+            if not chat_model or "/" not in chat_model:
+                self.chat_model_combo.setCurrentText(NVIDIA_PLACEHOLDER_MODEL)
+            if not vision_model or "/" not in vision_model:
+                self.vision_model_combo.setCurrentText(NVIDIA_PLACEHOLDER_MODEL)
 
     def _populate_asr_input_devices(self, config: dict):
         selected = str(config.get("asr_input_device", "auto") or "auto")
@@ -847,6 +885,8 @@ class SettingsPanel(QtWidgets.QFrame):
                 "auto_network_view_checks": self.network_audit_chk.isChecked(),
                 "vision_enabled": True,
                 "ollama_url": self.url_edit.text().strip(),
+                "openai_base_url": getattr(self, "openai_url_edit", self.url_edit).text().strip() if hasattr(self, "openai_url_edit") else "",
+                "api_key": getattr(self, "api_key_edit", self.url_edit).text().strip() if hasattr(self, "api_key_edit") else "",
                 "asr_model": self.asr_model_combo.currentData() or "base.en",
                 "asr_input_device": self.asr_input_combo.currentData() or "auto",
                 "ui": {

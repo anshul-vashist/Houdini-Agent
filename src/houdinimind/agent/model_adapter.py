@@ -16,11 +16,23 @@ class ModelAdapter:
 
     def _detect_tier(self) -> str:
         """Detect the model tier based on name hints or context window."""
+        # Any model served via a managed cloud backend is treated as cloud-tier
+        # regardless of parameter count, so the agent does not inject the
+        # weak-model few-shot prompts or aggressive history trimming meant for
+        # small local models.
+        backend = str(self.config.get("backend", "") or "").strip().lower()
+        if backend in ("nvidia", "openai", "anthropic", "openrouter"):
+            return "cloud"
+        backend = str(self.config.get("backend", "") or "").strip().lower()
+        if backend in ("nvidia", "openai", "anthropic", "openrouter"):
+            return "cloud"
         if (
             "cloud" in self.model_name
             or "kimi" in self.model_name
             or "gpt" in self.model_name
             or "claude" in self.model_name
+            or "gemini" in self.model_name
+            or self.model_name.startswith(("nvidia/", "openai/", "anthropic/"))
         ):
             return "cloud"
         size_matches = re.findall(r"(\d+(?:\.\d+)?)b", self.model_name)
