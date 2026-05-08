@@ -360,7 +360,7 @@ class PanelBackendMixin:
                 cred = CredentialStore(self.config.get("data_dir", ""))
                 cred.save_api_key(raw_api_key)
                 self.config["api_key"] = raw_api_key
-            except Exception as e:
+            except Exception:
                 self.config["api_key"] = raw_api_key
         else:
             try:
