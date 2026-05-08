@@ -610,6 +610,7 @@ QUICK_PROMPTS = [
 
 NVIDIA_PLACEHOLDER_MODEL = ""
 
+
 class ModelCombo(QtWidgets.QComboBox):
     """ComboBox that can be populated from Ollama /api/tags."""
 
@@ -783,7 +784,7 @@ class SettingsPanel(QtWidgets.QFrame):
         # Ollama URL
         self.url_edit = QtWidgets.QLineEdit(config.get("ollama_url", "http://localhost:11434"))
         self.url_edit.editingFinished.connect(self._emit)
-        
+
         self.url_label = QtWidgets.QLabel("Ollama URL:")
         grid.addRow(self.url_label, self.url_edit)
 
@@ -799,7 +800,7 @@ class SettingsPanel(QtWidgets.QFrame):
         self.api_key_edit = QtWidgets.QLineEdit()
         self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.api_key_edit.setPlaceholderText("Paste NVIDIA API key")
-        
+
         api_key = str(config.get("api_key", "") or "")
         self.api_key_edit.setText(api_key)
         self.api_key_edit.editingFinished.connect(self._emit)
@@ -885,8 +886,12 @@ class SettingsPanel(QtWidgets.QFrame):
                 "auto_network_view_checks": self.network_audit_chk.isChecked(),
                 "vision_enabled": True,
                 "ollama_url": self.url_edit.text().strip(),
-                "openai_base_url": getattr(self, "openai_url_edit", self.url_edit).text().strip() if hasattr(self, "openai_url_edit") else "",
-                "api_key": getattr(self, "api_key_edit", self.url_edit).text().strip() if hasattr(self, "api_key_edit") else "",
+                "openai_base_url": getattr(self, "openai_url_edit", self.url_edit).text().strip()
+                if hasattr(self, "openai_url_edit")
+                else "",
+                "api_key": getattr(self, "api_key_edit", self.url_edit).text().strip()
+                if hasattr(self, "api_key_edit")
+                else "",
                 "asr_model": self.asr_model_combo.currentData() or "base.en",
                 "asr_input_device": self.asr_input_combo.currentData() or "auto",
                 "ui": {

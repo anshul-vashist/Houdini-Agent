@@ -19,16 +19,20 @@ except ImportError:
 class PanelBackendMixin:
     def _urlopen_with_ssl_fallback(self, req, timeout: int):
         import ssl
+
         try:
             import certifi
+
             context = ssl.create_default_context(cafile=certifi.where())
         except Exception:
             context = ssl.create_default_context()
         try:
             import urllib.request
+
             return urllib.request.urlopen(req, timeout=timeout, context=context)
         except ssl.SSLCertVerificationError:
             import urllib.request
+
             return urllib.request.urlopen(
                 req,
                 timeout=timeout,
@@ -357,6 +361,7 @@ class PanelBackendMixin:
         if raw_api_key:
             try:
                 from houdinimind.agent.credential_store import CredentialStore
+
                 cred = CredentialStore(self.config.get("data_dir", ""))
                 cred.save_api_key(raw_api_key)
                 self.config["api_key"] = raw_api_key
@@ -365,6 +370,7 @@ class PanelBackendMixin:
         else:
             try:
                 from houdinimind.agent.credential_store import CredentialStore
+
                 cred = CredentialStore(self.config.get("data_dir", ""))
                 cred.delete_api_key()
             except Exception:
