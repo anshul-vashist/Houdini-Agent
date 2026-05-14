@@ -40,6 +40,9 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
     This fixes cases where a node references an input that is defined
     later in the chain (e.g. copytopoints referencing a scatter node
     that appears after it).
+
+    If ``cleanup_on_error`` is true, any node created by this call is removed
+    before returning an error.
     """
     try:
         _require_hou()
@@ -51,6 +54,36 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
             return _err(f"Parent not found: {parent_path}")
         if not isinstance(chain, list) or not chain:
             return _err("chain must be a non-empty list of node steps")
+
+        # Smaller tool-calling models routinely confuse this schema with
+        # `create_node`'s schema and emit `node_type`/`parameters` instead of
+        # `type`/`parms`. Normalise once here so every downstream pass sees
+        # canonical keys. O(steps) dict touches — negligible vs. node cooks.
+        for _step in chain:
+            if not isinstance(_step, dict):
+                continue
+            if "type" not in _step and "node_type" in _step:
+                _step["type"] = _step.pop("node_type")
+            if "type" not in _step:
+                _name = str(_step.get("name") or "").strip().lower()
+                _prefix = re.sub(r"[^a-z_].*$", "", _name)
+                _inferred = {
+                    "box": "box",
+                    "sphere": "sphere",
+                    "grid": "grid",
+                    "tube": "tube",
+                    "torus": "torus",
+                    "xform": "xform",
+                    "transform": "xform",
+                    "merge": "merge",
+                    "null": "null",
+                    "out": "null",
+                    "output": "null",
+                }.get(_prefix)
+                if _inferred:
+                    _step["type"] = _inferred
+            if "parms" not in _step and "parameters" in _step:
+                _step["parms"] = _step.pop("parameters")
 
         # Pyro safety rule: SOP Pyro Solver must receive rasterized volumes,
         # not raw source points. If an LLM builds a generic chain instead of
@@ -174,6 +207,8 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
         created = []
         step_errors = []
         created_nodes = []
+        created_nodes_by_step = []
+        created_by_step = {}
         active_sop_parent = None
         generators = {
             "box",
@@ -214,8 +249,12 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
         for step_index, step in enumerate(chain, start=1):
             raw_type = step.get("type", "")
             if not isinstance(raw_type, str) or not raw_type.strip():
+                seen_keys = sorted(k for k in step.keys() if isinstance(k, str))
                 step_errors.append(
-                    f"Step {step_index}: node type is required and must be a non-empty string"
+                    f"Step {step_index}: missing `type` key (saw keys: "
+                    f"{seen_keys}). Each chain step needs `type` set to the "
+                    f"internal node-type string as a non-empty string, e.g. 'box', 'tube', "
+                    f"'attribwrangle'."
                 )
                 continue
             raw_type = raw_type.strip()
@@ -247,13 +286,18 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
                 # Set VEX
                 if vex:
                     vex = vex.replace("\r\n", "\n").replace("\r", "\n")
-                    snippet = node.parm("snippet")
-                    if snippet:
-                        snippet.set(vex)
-                    else:
-                        step_errors.append(
-                            f"Step {step_index} '{node.name()}': no snippet parm for VEX"
-                        )
+                    vr = _set_node_parameter(
+                        node,
+                        "snippet",
+                        vex,
+                        parm_cache={"names": [p.name() for p in node.parms()]},
+                        cook_vex=False,
+                    )
+                    msg = vr.get("message", "")
+                    if vr.get("status") != "ok":
+                        step_errors.append(f"Step {step_index} '{node.name()}' VEX rejected: {msg}")
+                    elif "WARNING:" in msg:
+                        step_errors.append(f"Step {step_index} '{node.name()}' VEX: {msg}")
 
                 info = {
                     "path": node.path(),
@@ -262,6 +306,8 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
                     "step_index": step_index,
                 }
                 created.append(info)
+                created_by_step[step_index] = info
+                created_nodes_by_step.append((step_index, node))
                 nodes_by_name[node.name()] = node
                 # Also register the requested name (may differ from actual name
                 # if Houdini appended a number to avoid collisions).
@@ -294,8 +340,9 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
 
             # Find the node created for this step
             node = None
-            if step_index <= len(created):
-                node = hou.node(created[step_index - 1]["path"])
+            step_info = created_by_step.get(step_index)
+            if step_info:
+                node = hou.node(step_info["path"])
             if not node and name:
                 node = nodes_by_name.get(name)
             if not node:
@@ -354,7 +401,7 @@ def create_node_chain(parent_path, chain, cleanup_on_error=False):
         # ══════════════════════════════════════════════════════════════
         # POST: Cook all nodes, set display flag, layout
         # ══════════════════════════════════════════════════════════════
-        for step_index, node in enumerate(created_nodes, start=1):
+        for step_index, node in created_nodes_by_step:
             try:
                 node.cook(force=True)
                 cook_res = list(node.errors())

@@ -11,7 +11,11 @@ It strictly observes without modifying, extracting a topology graph,
 input connections, error/warning states, and semantic roles.
 """
 
+import time
 from typing import Any
+
+_DEFAULT_MAX_NODES = 220
+_DEFAULT_TIME_BUDGET_S = 1.25
 
 try:
     import hou
@@ -35,7 +39,13 @@ class SceneObserver:
     last observe(), the cached snapshot is returned instantly.
     """
 
-    def __init__(self, roots: list[str] | None = None, modeling_fx_only: bool = False):
+    def __init__(
+        self,
+        roots: list[str] | None = None,
+        modeling_fx_only: bool = False,
+        max_nodes: int = _DEFAULT_MAX_NODES,
+        time_budget_s: float = _DEFAULT_TIME_BUDGET_S,
+    ):
         if roots is not None:
             self.roots = roots
         elif modeling_fx_only:
@@ -46,6 +56,10 @@ class SceneObserver:
             self.roots = ["/obj", "/stage", "/mat", "/out"]
         # Limit recursive depth to avoid scanning thousands of internal nodes
         self.max_depth = 5
+        self.max_nodes = max(1, int(max_nodes))
+        self.time_budget_s = max(0.05, float(time_budget_s))
+        self._scan_deadline = 0.0
+        self._scan_truncated = False
         self._cache_epoch = None
         self._cache_snapshot: dict[str, Any] = None
 
@@ -72,21 +86,34 @@ class SceneObserver:
         ):
             return self._cache_snapshot
 
-        topology = self._build_scene_graph()
-        issues = self._detect_scene_issues(topology)
-        semantics = self._semantic_role_inference(topology)
-        context = self._get_current_context()
+        self._scan_deadline = time.monotonic() + self.time_budget_s
+        self._scan_truncated = False
+        try:
+            topology = self._build_scene_graph()
+            issues = self._detect_scene_issues(topology)
+            semantics = self._semantic_role_inference(topology)
+            context = self._get_current_context()
+        finally:
+            self._scan_deadline = 0.0
 
         snapshot = {
             "topology": topology,
             "issues": issues,
             "semantics": semantics,
             "context": context,
+            "truncated": self._scan_truncated,
         }
         if scene_epoch is not None:
             self._cache_epoch = scene_epoch
             self._cache_snapshot = snapshot
         return snapshot
+
+    def _budget_exhausted(self) -> bool:
+        deadline = getattr(self, "_scan_deadline", 0.0)
+        if deadline and time.monotonic() >= deadline:
+            self._scan_truncated = True
+            return True
+        return False
 
     def _build_scene_graph(self) -> list[dict[str, Any]]:
         """
@@ -104,10 +131,13 @@ class SceneObserver:
                 return False
 
         def scan(parent, cur_depth):
-            if cur_depth > self.max_depth:
+            if cur_depth > self.max_depth or len(all_nodes) >= self.max_nodes:
                 return
             try:
                 for child in parent.children():
+                    if len(all_nodes) >= self.max_nodes or self._budget_exhausted():
+                        self._scan_truncated = True
+                        return
                     inputs = []
                     try:
                         for inp in child.inputs():
@@ -168,10 +198,16 @@ class SceneObserver:
                     if _is_hda_asset(child):
                         continue
                     scan(child, cur_depth + 1)
+                    if len(all_nodes) >= self.max_nodes or self._budget_exhausted():
+                        self._scan_truncated = True
+                        return
             except Exception:
                 pass
 
         for r_path in self.roots:
+            if len(all_nodes) >= self.max_nodes or self._budget_exhausted():
+                self._scan_truncated = True
+                break
             root_node = hou.node(r_path)
             if root_node:
                 scan(root_node, 1)
@@ -196,6 +232,8 @@ class SceneObserver:
         issues = []
 
         for n_data in topology:
+            if self._budget_exhausted():
+                break
             node = n_data.pop("_ref", None)
             if not node:
                 continue
@@ -230,8 +268,16 @@ class SceneObserver:
             # 3. Empty Geometry Detection (SOPs only)
             try:
                 if node.type().category().name() == "Sop" and not errs and not n_data.get("bypass"):
+                    if hasattr(node, "isDirty") and node.isDirty():
+                        continue
                     geo = node.geometry()
-                    if geo and len(geo.points()) == 0:
+                    point_count = None
+                    if geo:
+                        try:
+                            point_count = geo.intrinsicValue("pointcount")
+                        except Exception:
+                            point_count = len(geo.points())
+                    if geo and point_count == 0:
                         # Only warn if it's not a node expected to be empty (like a Null or specific generators)
                         if node.type().name() not in ["null", "output"]:
                             warns.append(

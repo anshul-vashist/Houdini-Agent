@@ -1256,6 +1256,7 @@ class MemoryManager:
     """
 
     def __init__(self, data_dir: str, debug_logger=None, hou_job_dir: str | None = None):
+        from .cognitive_memory import CognitiveMemoryStore
         from .session_log import SessionLog
 
         self.data_dir = data_dir
@@ -1287,6 +1288,7 @@ class MemoryManager:
         self.session_log = SessionLog(os.path.join(db_dir, "sessions.db"))
         self.recipe_book = RecipeBook(os.path.join(db_dir, "recipes.db"))
         self.project_rules = ProjectRuleBook(os.path.join(db_dir, "project_rules.db"))
+        self.cognitive_memory = CognitiveMemoryStore(os.path.join(db_dir, "cognitive_memory.db"))
         self.pattern_analyser = PatternAnalyser(self.session_log, self.recipe_book)
         self.self_updater = SelfUpdater(self.recipe_book, job_dir)
         self.meta_rule_learner = MetaRuleLearner(
@@ -1299,6 +1301,8 @@ class MemoryManager:
         )
         self._current_interaction_id: int | None = None
         self._last_user_message: str = ""
+        self._current_tool_failures: list[dict] = []
+        self._current_tool_successes: list[dict] = []
         self.debug_logger = debug_logger  # optional, set after construction
 
     def _get_current_hip_path(self) -> str:
@@ -1318,6 +1322,8 @@ class MemoryManager:
     def start_interaction(self, user_message: str, domain: str | None = None) -> int:
         try:
             self._last_user_message = user_message or ""
+            self._current_tool_failures = []
+            self._current_tool_successes = []
             rules_before = self.project_rules.stats().get("total_rules", 0)
 
             self.project_rules.remember_from_message(self._last_user_message)
@@ -1368,6 +1374,30 @@ class MemoryManager:
             self.session_log.log_tool_call(tool_name, args, result, self._current_interaction_id)
         except Exception:
             pass
+        try:
+            safe_result = result if isinstance(result, dict) else {"status": "ok", "data": result}
+            self.cognitive_memory.record_tool_event(
+                tool_name=tool_name,
+                args=args or {},
+                result=safe_result,
+                request=self._last_user_message,
+            )
+            event = {
+                "tool": tool_name,
+                "args": args or {},
+                "status": safe_result.get("status", ""),
+                "message": safe_result.get("message", ""),
+            }
+            if safe_result.get("status") == "error":
+                self._current_tool_failures.append(event)
+            elif safe_result.get("status") == "ok":
+                self._current_tool_successes.append(event)
+        except Exception as e:
+            if self.debug_logger:
+                self.debug_logger.log_memory_op(
+                    "cognitive_tool_event_failed",
+                    meta={"error": str(e)[:180], "tool": tool_name},
+                )
 
     def log_scene_event(self, category: str, data: dict):
         try:
@@ -1433,6 +1463,7 @@ class MemoryManager:
             "new_user_lessons": new_user_lessons,
             "recipe_stats": self.recipe_book.stats(),
             "log_stats": self.session_log.stats(),
+            "cognitive_memory": self.cognitive_memory.compact(),
         }
         result["kb_rebuilt"] = kb_rebuilt
         if kb_error:
@@ -1490,9 +1521,124 @@ class MemoryManager:
     def get_project_rules_prompt(self, limit: int = 8) -> str:
         return self.project_rules.render_for_prompt(limit=limit)
 
+    def retrieve_agent_context(
+        self,
+        query: str,
+        *,
+        embed_fn=None,
+        limit: int = 8,
+        max_chars: int = 2600,
+    ) -> str:
+        """Return ranked memory context for the active agent turn."""
+        try:
+            return self.cognitive_memory.render_prompt_context(
+                query,
+                kinds=("failure", "reflection", "procedural", "semantic", "episodic", "tool_usage"),
+                limit=limit,
+                max_chars=max_chars,
+                embed_fn=embed_fn,
+            )
+        except Exception as e:
+            if self.debug_logger:
+                self.debug_logger.log_memory_op(
+                    "cognitive_retrieval_failed",
+                    meta={"error": str(e)[:180], "query": query[:180]},
+                )
+            return ""
+
+    def remember_turn_outcome(
+        self,
+        *,
+        user_message: str,
+        agent_response: str,
+        request_mode: str,
+        verification_report: dict | None = None,
+        tool_history: list[str] | None = None,
+        write_tools: list[str] | None = None,
+        scene_diff: str | None = None,
+        embed_fn=None,
+    ) -> str:
+        """Store a post-turn reflection that future planning can retrieve."""
+        report = verification_report or {}
+        status = str(report.get("status") or "").lower()
+        failures = list(self._current_tool_failures[-8:])
+        successes = list(self._current_tool_successes[-12:])
+        writes = list(write_tools or [])
+
+        if status == "pass":
+            score = 0.9
+            outcome = "verified_success"
+        elif status == "fail":
+            score = 0.35
+            outcome = "verification_failed"
+        elif writes:
+            score = 0.72
+            outcome = "executed_without_full_verification"
+        elif failures:
+            score = 0.25
+            outcome = "tool_failures_without_progress"
+        else:
+            score = 0.55
+            outcome = "advice_or_no_scene_change"
+
+        lessons: list[str] = []
+        if failures:
+            for failure in failures[:4]:
+                lessons.append(
+                    "Avoid repeating "
+                    f"{failure.get('tool')} with the same arguments when it fails with: "
+                    f"{str(failure.get('message') or '')[:180]}"
+                )
+        issues = report.get("issues") or []
+        for issue in issues[:4]:
+            if isinstance(issue, dict):
+                lessons.append(
+                    "Verification issue to prevent next time: "
+                    + str(issue.get("message") or "")[:220]
+                )
+        if outcome.startswith("verified") and writes:
+            lessons.append(
+                "Successful tool sequence for similar requests: "
+                + ", ".join(dict.fromkeys(writes or tool_history or []))
+            )
+        if not lessons and scene_diff:
+            lessons.append("Scene outcome: " + scene_diff.replace("\n", " ")[:260])
+
+        metadata = {
+            "request_mode": request_mode,
+            "verification_status": status or "none",
+            "tool_history": list(tool_history or [])[-30:],
+            "write_tools": writes[-20:],
+            "failure_count": len(failures),
+            "success_count": len(successes),
+            "response_excerpt": (agent_response or "")[:800],
+            "scene_diff": (scene_diff or "")[:1200],
+        }
+        memory_id = self.cognitive_memory.record_reflection(
+            request=user_message,
+            outcome=outcome,
+            score=score,
+            lessons=lessons,
+            metadata=metadata,
+            embed_fn=embed_fn,
+        )
+        if self.debug_logger:
+            self.debug_logger.log_memory_op(
+                "turn_reflection",
+                meta={
+                    "memory_id": memory_id,
+                    "outcome": outcome,
+                    "score": score,
+                    "lessons": len(lessons),
+                    "summary": f"{outcome} score={score:.2f} lessons={len(lessons)}",
+                },
+            )
+        return memory_id
+
     def dashboard(self) -> dict:
         return {
             "log": self.session_log.stats(),
             "recipes": self.recipe_book.stats(),
             "project_rules": self.project_rules.stats(),
+            "cognitive_memory": self.cognitive_memory.stats(),
         }

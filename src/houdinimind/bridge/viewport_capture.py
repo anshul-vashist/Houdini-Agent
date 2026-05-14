@@ -158,7 +158,12 @@ def _find_houdini_main_window() -> QtWidgets.QWidget | None:
 
 
 def _find_scene_viewer_widget() -> QtWidgets.QWidget | None:
-    """Best-effort lookup for the visible Scene Viewer widget."""
+    """Best-effort lookup for the visible Scene Viewer widget.
+
+    Uses the same positive/negative keyword filtering as
+    ``_is_scene_viewer_widget`` so the HoudiniMind chat panel and
+    other non-viewport panes are never returned.
+    """
     app = QtWidgets.QApplication.instance()
     if app is None:
         return None
@@ -168,17 +173,10 @@ def _find_scene_viewer_widget() -> QtWidgets.QWidget | None:
         try:
             if not w.isVisible():
                 continue
-            cls = w.metaObject().className().lower()
-            obj = (w.objectName() or "").lower()
-            title = ""
-            try:
-                title = (w.windowTitle() or "").lower()
-            except Exception:
-                pass
-            if any(
-                token in cls or token in obj or token in title
-                for token in ("sceneviewer", "scene viewer", "viewport", "glview", "glviewport")
-            ):
+            # Skip tiny widgets (toolbar icons, buttons, etc.)
+            if w.width() < 200 or w.height() < 200:
+                continue
+            if _is_scene_viewer_widget(w):
                 candidates.append(w)
         except Exception:
             continue
@@ -188,7 +186,12 @@ def _find_scene_viewer_widget() -> QtWidgets.QWidget | None:
 
 
 def _is_scene_viewer_widget(widget: QtWidgets.QWidget) -> bool:
-    """Return True only for widgets that identify as a Scene Viewer/viewport."""
+    """Return True only for widgets that identify as a Scene Viewer/viewport.
+
+    The negative-keyword list is deliberately broad so the HoudiniMind Python
+    Panel (and similar chat/agent UIs) can never be mistaken for the 3-D
+    viewport, even if their parent pane-tab carries a 'viewport' token.
+    """
     try:
         cls = widget.metaObject().className().lower()
     except Exception:
@@ -202,7 +205,26 @@ def _is_scene_viewer_widget(widget: QtWidgets.QWidget) -> bool:
     except Exception:
         title = ""
     text = " ".join([cls, obj, title])
-    negative = ("chat", "message", "conversation", "houdinimind", "panel")
+    negative = (
+        "chat",
+        "message",
+        "conversation",
+        "houdinimind",
+        "panel",
+        "pythonpanel",
+        "python_panel",
+        "agent",
+        "pyside",
+        "input",
+        "scroll",
+        "button",
+        "label",
+        "settings",
+        "composer",
+        "chat_lane",
+        "tool_card",
+        "bubble",
+    )
     positive = ("sceneviewer", "scene viewer", "viewport", "glview", "glviewport")
     return any(token in text for token in positive) and not any(token in text for token in negative)
 
@@ -306,11 +328,8 @@ def _flipbook_viewport(viewer, scale: float = 0.75) -> str | None:
     This is the most reliable path for actual 3D viewport contents.
     """
     try:
-        viewport = viewer.curViewport()
-        if viewport is None:
-            return None
-
-        # Make a best-effort attempt to bring the viewer forward.
+        # 1. Force the viewer to be the current tab BEFORE we ask for the viewport.
+        # If it's not current, curViewport() often returns None.
         for method_name in ("setIsCurrentTab", "setCurrent", "setFocus", "raise_"):
             try:
                 method = getattr(viewer, method_name, None)
@@ -321,6 +340,23 @@ def _flipbook_viewport(viewer, scale: float = 0.75) -> str | None:
                         method(True)
             except Exception:
                 pass
+
+        # Give Houdini a moment to switch tabs and redraw
+        try:
+            import hou
+
+            hou.ui.triggerUpdate()
+            import time as _time
+
+            _time.sleep(0.15)  # increased from 0.1 for reliable redraw
+        except Exception:
+            pass
+
+        viewport = viewer.curViewport()
+        if viewport is None:
+            raise RuntimeError(
+                "viewer.curViewport() returned None. The viewer might be fully obscured or invalid."
+            )
 
         flip_settings = viewer.flipbookSettings().stash()
         import tempfile
@@ -354,16 +390,18 @@ def _flipbook_viewport(viewer, scale: float = 0.75) -> str | None:
         # Poll briefly — flipbook sometimes returns before the file is flushed.
         import time as _time
 
-        for _ in range(10):
+        for _ in range(30):  # Wait up to 3 seconds
             if os.path.exists(tmp_path):
                 break
             _time.sleep(0.1)
         else:
-            return None
+            raise RuntimeError(
+                f"Houdini failed to write flipbook file to {tmp_path} after 3 seconds."
+            )
 
         pixmap = QtGui.QPixmap(tmp_path)
         if pixmap.isNull():
-            return None
+            raise RuntimeError(f"QPixmap failed to load valid image data from {tmp_path}")
         if scale != 1.0:
             new_w = int(pixmap.width() * scale)
             new_h = int(pixmap.height() * scale)
@@ -381,8 +419,7 @@ def _flipbook_viewport(viewer, scale: float = 0.75) -> str | None:
             pass
         return b64_str
     except Exception as e:
-        print(f"[HoudiniMind Vision] flipbook_viewport error: {e}")
-        return None
+        raise RuntimeError(f"Flipbook failed: {e!s}")
 
 
 # ---------------------------------------------------------------------------
@@ -428,19 +465,38 @@ def capture_network_editor(scale: float = 0.75, node_path: str | None = None) ->
 
 def _frame_viewport(viewer, padding: float = 0.12) -> None:
     """
-    Frame all objects in the viewport (equivalent to pressing 'F') and then
-    dolly the camera back by ``padding`` so geometry has breathing room and
-    doesn't kiss the frame edges. ``frameAll()`` alone fits the bbox exactly,
-    which causes top/bottom clipping when the bbox aspect doesn't match the
-    framebuffer aspect.
-
-    Silently no-ops if the viewer or viewport is unavailable.
+    Frame all objects in the viewport by simulating a human selecting the
+    display nodes and calling frameSelected().
     """
     try:
+        import hou
+
         viewport = viewer.curViewport()
         if viewport is None:
             return
-        viewport.frameAll()
+
+        # Find displayed SOPs to select them for framing
+        displayed_nodes = []
+        for obj in hou.node("/obj").children():
+            if obj.isDisplayFlagSet():
+                disp = obj.displayNode()
+                if disp:
+                    displayed_nodes.append(disp)
+                else:
+                    displayed_nodes.append(obj)
+
+        if displayed_nodes:
+            hou.clearAllSelected()
+            for node in displayed_nodes:
+                node.setSelected(True, clear_all_selected=False)
+
+        hou.ui.triggerUpdate()
+
+        try:
+            viewport.frameSelected()
+        except Exception:
+            viewport.frameAll()
+
         try:
             cam = viewport.defaultCamera()
             # Ortho: widen the ortho frustum to add margin.
@@ -461,15 +517,17 @@ def _frame_viewport(viewer, padding: float = 0.12) -> None:
             viewport.setDefaultCamera(cam)
         except Exception:
             pass
+
         # Force a UI repaint so the new framing is visible in the grab
         try:
-            import hou
-
             hou.ui.triggerUpdate()
+            import time as _t
+
+            _t.sleep(0.15)
         except Exception:
             pass
     except Exception as e:
-        print(f"[HoudiniMind Vision] frameAll error (non-fatal): {e}")
+        print(f"[HoudiniMind Vision] frameSelected error (non-fatal): {e}")
 
 
 def capture_viewport(scale: float = 0.75) -> str | None:
@@ -484,34 +542,87 @@ def capture_viewport(scale: float = 0.75) -> str | None:
     if not HOU_AVAILABLE:
         return None
     try:
+        import hou
+
         desktop = hou.ui.curDesktop()
-        viewer = desktop.paneTabOfType(hou.paneTabType.SceneViewer)
-        if not viewer:
+        errors = []
+
+        # Collect every SceneViewer pane tab
+        viewers = []
+
+        try:
+            import toolutils
+
+            sv = toolutils.sceneViewer()
+            if sv:
+                viewers.append(sv)
+        except Exception:
+            pass
+
+        try:
+            for pane in desktop.paneTabs():
+                try:
+                    if pane.type() == hou.paneTabType.SceneViewer and pane not in viewers:
+                        viewers.append(pane)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if not viewers and desktop:
+            try:
+                single = desktop.paneTabOfType(hou.paneTabType.SceneViewer)
+                if single and single not in viewers:
+                    viewers.append(single)
+            except Exception:
+                pass
+
+        if not viewers:
             return None
 
-        # Prefer the actual viewport render over Qt/screen grabs. This is
-        # slower but avoids feeding chat-panel screenshots into visual QA.
-        _frame_viewport(viewer)
-        b64 = _flipbook_viewport(viewer, scale=scale)
-        if b64:
-            return b64
+        # Try each viewer in turn; prefer the one that is already current.
+        def _viewer_priority(v):
+            try:
+                return 0 if v.isCurrentTab() else 1
+            except Exception:
+                return 1
 
-        # Fallback: grab an explicitly identifiable Scene Viewer widget.
-        widget = _widget_for_pane(viewer)
-        if widget:
-            b64 = _grab_widget(widget, scale=scale)
-            if b64:
-                return b64
+        viewers.sort(key=_viewer_priority)
 
-        # Last fallback: exact pane rectangle. This may still fail in detached
-        # pane layouts, but is safer than a main-window capture.
-        bounds = _extract_screen_rect(viewer.screenBounds())
-        if bounds:
-            b64 = _grab_screen_rect(
-                bounds[0], bounds[1], bounds[2] - bounds[0], bounds[3] - bounds[1]
-            )
-            if b64:
-                return b64
+        for viewer in viewers:
+            # Ensure this viewer is the active tab before framing or flipbooking.
+            try:
+                viewer.setIsCurrentTab()
+                hou.ui.triggerUpdate()
+                import time as _t
+
+                _t.sleep(0.15)  # give Houdini time to switch and redraw
+            except Exception:
+                pass
+
+            try:
+                _frame_viewport(viewer)
+                b64 = _flipbook_viewport(viewer, scale=scale)
+                if b64:
+                    return b64
+            except Exception as e:
+                errors.append(f"flipbook failed: {e!s}")
+
+            # Fallback: grab an explicitly identifiable Scene Viewer widget.
+            widget = _widget_for_pane(viewer)
+            if widget:
+                b64 = _grab_widget(widget, scale=scale)
+                if b64:
+                    return b64
+
+            # Last fallback for this viewer: exact pane rectangle.
+            bounds = _extract_screen_rect(viewer.screenBounds())
+            if bounds:
+                b64 = _grab_screen_rect(
+                    bounds[0], bounds[1], bounds[2] - bounds[0], bounds[3] - bounds[1]
+                )
+                if b64:
+                    return b64
 
         # Final non-invasive fallback: grab the visible Scene Viewer widget if
         # it exists but the pane lookup failed above.
@@ -521,12 +632,31 @@ def capture_viewport(scale: float = 0.75) -> str | None:
             if b64:
                 return b64
 
-        # Do not fall back to the whole main window for viewport captures:
-        # that can capture the chat panel and create false visual evidence.
-        return None
+        # ULTIMATE FALLBACK: If the layout is completely broken, maximized, or obscured,
+        # forcefully spawn a floating SceneViewer, capture it, and close the floating window.
+        if desktop:
+            try:
+                floating_pane = desktop.createFloatingPaneTab(hou.paneTabType.SceneViewer)
+                if floating_pane:
+                    import time as _t
+
+                    hou.ui.triggerUpdate()
+                    _t.sleep(0.3)  # Give OS time to map the new floating window
+                    _frame_viewport(floating_pane)
+                    b64 = _flipbook_viewport(floating_pane, scale=scale)
+                    try:
+                        floating_pane.pane().close()
+                    except Exception:
+                        floating_pane.close()
+                    if b64:
+                        return b64
+            except Exception as e:
+                errors.append(f"floating pane fallback failed: {e}")
+
+        # If we reach here, absolutely everything failed. Raise so the agent can debug it.
+        raise RuntimeError(f"All viewport capture methods failed. Debug info: {' | '.join(errors)}")
     except Exception as e:
-        print(f"[HoudiniMind Vision] capture_viewport error: {e}")
-        return None
+        raise RuntimeError(f"capture_viewport fatal error: {e}")
 
 
 def capture_main_window(scale: float = 0.5) -> str | None:

@@ -20,7 +20,13 @@ New in v2:
 """
 
 import json
+import time
 from collections import deque
+
+# Soft wall-clock budget for scene-graph traversal. Keeps a pathological scene
+# (huge / cyclic / proxy-stuffed) from blocking the agent's read tools. If the
+# budget elapses we return what we have so far.
+_DEFAULT_TRAVERSAL_BUDGET_S = 4.0
 
 try:
     import hou
@@ -39,6 +45,7 @@ class SceneReader:
         include_dop_summary: bool = True,
         include_usd_summary: bool = True,
         include_material_assignments: bool = True,
+        traversal_time_budget_s: float | None = None,
     ):
         self.max_nodes = max_nodes
         self.max_parms_per_node = max_parms_per_node
@@ -46,6 +53,7 @@ class SceneReader:
         self.include_dop_summary = include_dop_summary
         self.include_usd_summary = include_usd_summary
         self.include_material_assignments = include_material_assignments
+        self.traversal_time_budget_s = traversal_time_budget_s
 
     @staticmethod
     def _safe_children(node) -> list:
@@ -55,12 +63,21 @@ class SceneReader:
             return []
 
     @staticmethod
-    def _iter_subchildren(root, limit: int | None = None) -> list:
+    def _iter_subchildren(
+        root,
+        limit: int | None = None,
+        time_budget_s: float | None = None,
+    ) -> list:
+        budget = float(time_budget_s) if time_budget_s is not None else _DEFAULT_TRAVERSAL_BUDGET_S
+        deadline = time.monotonic() + budget if budget > 0 else None
+
         direct_children = SceneReader._safe_children(root)
         if direct_children:
             result = []
             queue = deque(direct_children)
             while queue and (limit is None or len(result) < limit):
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 node = queue.popleft()
                 result.append(node)
                 if limit is not None and len(result) >= limit:
@@ -124,7 +141,11 @@ class SceneReader:
         error_nodes = []
         cook_hotspots = []
 
-        raw_nodes = self._iter_subchildren(root, limit=self.max_nodes)
+        raw_nodes = self._iter_subchildren(
+            root,
+            limit=self.max_nodes,
+            time_budget_s=self.traversal_time_budget_s,
+        )
         for node in raw_nodes:
             s = self._serialise_node(node)
             nodes.append(s)

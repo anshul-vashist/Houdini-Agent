@@ -7,7 +7,9 @@
 Performance, organization, export, animation tools.
 """
 
+import difflib as _difflib
 import os as _os
+import time as _time
 import traceback as _tb
 
 from . import _core as core
@@ -38,12 +40,12 @@ def profile_network(parent_path, top_n=10):
             return _err(f"Parent not found: {parent_path}")
         results = []
         for node in parent.children():
-            t0 = core.time.perf_counter()
+            t0 = _time.perf_counter()
             try:
                 node.cook(force=True)
             except Exception:
                 pass
-            elapsed_ms = (core.time.perf_counter() - t0) * 1000
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
             results.append(
                 {
                     "path": node.path(),
@@ -785,59 +787,6 @@ def take_node_snapshot(node_path):
         return _err(str(e))
 
 
-def set_keyframe(node_path, parm_name, frame, value):
-    """Set a keyframe on a parameter at a specific frame."""
-    try:
-        _require_hou()
-        node = hou.node(node_path)
-        if not node:
-            return _err(f"Node not found: {node_path}")
-        parm = node.parm(parm_name)
-        if not parm:
-            return _err(f"Parameter '{parm_name}' not found on {node_path}")
-
-        key = hou.Keyframe()
-        key.setFrame(frame)
-        key.setValue(value)
-        parm.setKeyframe(key)
-        return _ok(
-            {
-                "message": f"Keyframe set on {node_path}/{parm_name} at frame {frame} with value {value}",
-                "undo_track": f"Set keyframe {node_path}/{parm_name} = {value} at frame {frame}",
-            }
-        )
-    except Exception as e:
-        return _err(str(e))
-
-
-def set_frame_range(start_frame, end_frame):
-    """Set the global animation frame range."""
-    try:
-        _require_hou()
-        hou.playbar.setFrameRange(start_frame, end_frame)
-        hou.playbar.setPlaybackRange(start_frame, end_frame)
-        return _ok(
-            {
-                "message": f"Global frame range set to {start_frame}-{end_frame}",
-                "undo_track": f"Set frame range {start_frame}-{end_frame}",
-            }
-        )
-    except Exception as e:
-        return _err(str(e))
-
-
-def go_to_frame(frame):
-    """Set the current playback frame."""
-    try:
-        _require_hou()
-        hou.setFrame(frame)
-        return _ok(
-            {"message": f"Current frame set to {frame}", "undo_track": f"Go to frame {frame}"}
-        )
-    except Exception as e:
-        return _err(str(e))
-
-
 # ── Animation ─────────────────────────────────────────────────────────────────
 
 
@@ -850,7 +799,13 @@ def set_keyframe(node_path, parm_name, value, frame=None, slope_in=None, slope_o
             return _err(f"Node not found: {node_path}")
         parm = node.parm(parm_name)
         if not parm:
-            return _err(f"Parm not found: {parm_name}")
+            all_names = [p.name() for p in node.parms()]
+            close = _difflib.get_close_matches(parm_name, all_names, n=5, cutoff=0.4)
+            hint = f" Similar: {', '.join(close)}" if close else ""
+            return _err(
+                f"Parameter '{parm_name}' not found on {node_path}."
+                f" Available parms (sample): {all_names[:20]}.{hint}"
+            )
         kf = hou.Keyframe()
         kf.setFrame(frame if frame is not None else hou.frame())
         kf.setValue(value)
@@ -878,7 +833,13 @@ def delete_keyframe(node_path, parm_name, frame=None):
             return _err(f"Node not found: {node_path}")
         p = node.parm(parm_name)
         if not p:
-            return _err(f"Parm not found: {parm_name}")
+            all_names = [p.name() for p in node.parms()]
+            close = _difflib.get_close_matches(parm_name, all_names, n=5, cutoff=0.4)
+            hint = f" Similar: {', '.join(close)}" if close else ""
+            return _err(
+                f"Parameter '{parm_name}' not found on {node_path}."
+                f" Available parms (sample): {all_names[:20]}.{hint}"
+            )
         if frame is not None:
             kfs = [k for k in p.keyframes() if int(k.frame()) == frame]
             for k in kfs:
@@ -900,7 +861,13 @@ def get_timeline_keyframes(node_path, parm_name):
             return _err(f"Node not found: {node_path}")
         p = node.parm(parm_name)
         if not p:
-            return _err(f"Parm not found: {parm_name}")
+            all_names = [p.name() for p in node.parms()]
+            close = _difflib.get_close_matches(parm_name, all_names, n=5, cutoff=0.4)
+            hint = f" Similar: {', '.join(close)}" if close else ""
+            return _err(
+                f"Parameter '{parm_name}' not found on {node_path}."
+                f" Available parms (sample): {all_names[:20]}.{hint}"
+            )
         kfs = []
         for k in p.keyframes():
             kfs.append(

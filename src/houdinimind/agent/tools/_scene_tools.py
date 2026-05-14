@@ -17,6 +17,21 @@ _err = core._err
 _require_hou = core._require_hou
 _ensure_parent_exists = core._ensure_parent_exists
 
+_HOUDINIMIND_SCRATCH_PREFIXES = (
+    "/obj/__HOUDINIMIND_TEMP_GEO__",
+    "/obj/__HOUDINIMIND_VEX_CHECKER__",
+)
+
+
+def _is_houdinimind_scratch_path(path):
+    if not path:
+        return False
+    path = str(path)
+    return any(path.startswith(prefix) for prefix in _HOUDINIMIND_SCRATCH_PREFIXES) or (
+        "__HOUDINIMIND_" in path
+    )
+
+
 try:
     import hou
 
@@ -89,6 +104,8 @@ def get_all_errors(include_warnings=True):
 
         results = []
         for issue in snapshot.get("issues", []):
+            if _is_houdinimind_scratch_path(issue.get("path")):
+                continue
             if not include_warnings and issue.get("severity") == "warning":
                 continue
             results.append(issue)

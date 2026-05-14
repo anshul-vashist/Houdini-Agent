@@ -1,0 +1,378 @@
+=============================================================================
+HOUDINIMIND CODEBASE EXPLORATION - COMPLETE SUMMARY
+=============================================================================
+
+Generated: 2026-05-06
+Explorer: Claude Code (Claude Haiku 4.5)
+Project Directory: /Users/anshulvashist/Downloads/HoudiniMind - Copy (2)
+Current Branch: polishing/houdinimind-polish
+
+=============================================================================
+DOCUMENTATION GENERATED
+=============================================================================
+
+1. FEATURE_OVERVIEW.md (743 lines)
+   - Comprehensive feature breakdown
+   - 70+ tools across 8 categories
+   - RAG/Knowledge base architecture
+   - UI/UX features
+   - Integration patterns
+   - Potential enhancement opportunities
+
+2. ARCHITECTURE_DIAGRAM.md (650 lines)
+   - System architecture diagrams (ASCII art)
+   - Tool execution flow
+   - Data flow from query to scene mutation
+   - Module dependencies tree
+   - Safety/validation layers
+   - Resource management
+   - Configuration priority
+   - Typical turn lifecycle
+
+3. This file: EXPLORATION_SUMMARY.txt
+   - Quick reference guide
+   - File locations
+   - Key statistics
+   - Main entry points
+
+=============================================================================
+KEY STATISTICS
+=============================================================================
+
+Tools:
+  - Total Functions: 70+
+  - Tool Modules: 16
+  - Node Tools: 20
+  - Chain Tools: 12
+  - Advanced Tools: 70+
+  - Perf/Org Tools: 28
+  - Inspection Tools: 8
+  - Geometry Tools: 9
+  - Knowledge Tools: 7
+  - Vision Tools: 4
+  - Simulation/PDG Tools: 15+
+
+Knowledge Base:
+  - SOP Documentation: 700+ entries
+  - Recipes: 50+
+  - Knowledge Shards: 12 categories
+  - Embedding Model: nomic-embed-text
+  - Search Type: Hybrid (BM25 + vector cosine similarity)
+
+UI Components:
+  - Panel Mixins: 6
+  - Qt Framework: PySide6
+  - Detail Modes: 3 (simple, intermediate, expert)
+  - Streaming: Real-time response chunks
+
+Agent Loop:
+  - Max Tool Rounds: 16
+  - Context Window: 32,768 tokens
+  - Turn Budget: 240s wall-clock
+  - Input Token Budget: 200k max
+  - Output Token Budget: 16k max
+
+Safety Layers:
+  - Retry Attempts: 3 with exponential backoff
+  - Failure Blacklist: 12-turn window
+  - Circuit Breaker: 4 consecutive LLM failures
+  - Tool Timeout: 90s (scene-mutating)
+  - Read Timeout: 30s (read-only)
+
+=============================================================================
+CORE COMPONENTS & FILE LOCATIONS
+=============================================================================
+
+AGENT ORCHESTRATION:
+├─ src/houdinimind/agent/loop.py (378KB - main orchestrator)
+├─ src/houdinimind/agent/async_jobs.py
+├─ src/houdinimind/agent/clarification.py
+├─ src/houdinimind/agent/preconditions.py
+├─ src/houdinimind/agent/critic.py
+├─ src/houdinimind/agent/budget.py
+├─ src/houdinimind/agent/task_contracts.py
+├─ src/houdinimind/agent/semantic_scoring.py
+├─ src/houdinimind/agent/request_modes.py
+└─ src/houdinimind/agent/tool_models.py
+
+TOOLS (16 MODULES):
+├─ src/houdinimind/agent/tools/_core.py (shared helpers)
+├─ src/houdinimind/agent/tools/_node_tools.py (20 tools)
+├─ src/houdinimind/agent/tools/_chain_tools.py (12 tools)
+├─ src/houdinimind/agent/tools/_advanced_tools.py (70+ tools)
+├─ src/houdinimind/agent/tools/_perf_org_tools.py (28 tools)
+├─ src/houdinimind/agent/tools/_inspection_tools.py (8 tools)
+├─ src/houdinimind/agent/tools/_geometry_tools.py (9 tools)
+├─ src/houdinimind/agent/tools/_knowledge_tools.py (7 tools)
+├─ src/houdinimind/agent/tools/_vision_tools.py (4 tools)
+├─ src/houdinimind/agent/tools/_pdg_tools.py (PDG/TOP tools)
+├─ src/houdinimind/agent/tools/_simulation_tools.py
+├─ src/houdinimind/agent/tools/_material_usd_tools.py
+├─ src/houdinimind/agent/tools/_scene_tools.py
+├─ src/houdinimind/agent/tools/_repair.py
+├─ src/houdinimind/agent/tools/_registry.py
+└─ src/houdinimind/agent/tools/__init__.py (tool registry & filtering)
+
+UI COMPONENTS (6 mixins):
+├─ src/houdinimind/agent/ui/_panel.py (main panel class)
+├─ src/houdinimind/agent/ui/_panel_backend.py (Ollama/models)
+├─ src/houdinimind/agent/ui/_panel_state.py (session state)
+├─ src/houdinimind/agent/ui/_panel_layout.py (Qt widgets)
+├─ src/houdinimind/agent/ui/_panel_dispatch.py (message routing)
+└─ src/houdinimind/agent/ui/_panel_workflows.py (job management)
+
+KNOWLEDGE & RAG:
+├─ src/houdinimind/rag/__init__.py
+├─ src/houdinimind/rag/retriever.py (BM25 + vector search)
+├─ src/houdinimind/rag/kb_builder.py (knowledge indexing)
+├─ src/houdinimind/rag/injector.py (RAG integration)
+└─ src/houdinimind/rag/bm25.py (keyword search)
+
+HOUDINI INTEGRATION:
+├─ src/houdinimind/bridge/__init__.py
+├─ src/houdinimind/bridge/viewport_capture.py (screenshots)
+├─ src/houdinimind/bridge/scene_reader.py (introspection)
+├─ src/houdinimind/bridge/event_hooks.py (SSE broadcaster)
+└─ src/houdinimind/bridge/render_tools.py (render interface)
+
+MEMORY & DEBUGGING:
+├─ src/houdinimind/memory/world_model.py (long-term memory)
+├─ src/houdinimind/debug.py (session logging)
+└─ src/houdinimind/agent/llm_client.py (Ollama integration)
+
+CONFIGURATION:
+├─ data/core_config.json (main config file - well documented)
+├─ data/knowledge/knowledge_base.json (700+ SOP docs)
+├─ data/knowledge/houdinimind_agent_recipes.json (50+ workflows)
+├─ data/knowledge/houdini_python_functions.json (HOM API docs)
+├─ data/knowledge/vex_functions.db (VEX reference)
+└─ data/knowledge/vex_dataset_final_merged.jsonl (VEX examples)
+
+=============================================================================
+MAIN EXECUTION FLOW
+=============================================================================
+
+1. User sends query from HoudiniMindPanel UI
+   ↓
+2. AgentLoop.run() processes query
+   - Detects intent (BUILD/VEX/HDA/DEBUG/RESEARCH)
+   - Validates scene references
+   - Optionally generates plan (adaptive)
+   - Validates preconditions
+   ↓
+3. Tool Selection Loop (max 16 rounds)
+   - LLM selects next tool
+   - Arguments validated against JSON Schema
+   - Tool executed with 90s timeout
+   - Scene state captured and analyzed
+   - Critic gates dangerous operations
+   ↓
+4. Observation & Verification
+   - Screenshot viewport (vision-enabled)
+   - Analyze geometry changes
+   - Semantic scoring (optional)
+   - Completion detection
+   ↓
+5. Response Generation
+   - Compile observations
+   - Stream to UI in real-time
+   - Log to session.md file
+
+=============================================================================
+CONFIGURATION HIGHLIGHTS
+=============================================================================
+
+Model Setup:
+- Main Model: gemma4:31b-cloud (via Ollama)
+- Embedding Model: nomic-embed-text
+- Vision Model: gemma4:31b-cloud
+- ASR Model: base.en (Whisper)
+
+Safety Thresholds:
+- Auto-execute confidence: 0.7 (70% required)
+- Semantic scoring threshold: 0.72
+- Tool retry attempts: 3
+- Circuit breaker: 4 consecutive failures
+- Failure blacklist window: 12 turns
+
+RAG Configuration:
+- Top-K results: 5
+- Hybrid search enabled: true
+- Max context per turn: 4000 tokens
+- Max shards queried: 5
+- Entry char cap: 20k (prevents distortion)
+
+Performance:
+- Turn wall-clock: 240s max
+- Scene-mutating timeout: 90s
+- Read-only timeout: 30s
+- Plan timeout: 90s
+- Stream silence cutoff: 60s
+
+=============================================================================
+MAJOR FEATURES IMPLEMENTED
+=============================================================================
+
+✓ Agent Loop v12
+  - Plan → Act → Observe → Critic cycle
+  - Adaptive planning (skips for trivial queries)
+  - Model routing per task type
+  - Full debug instrumentation
+
+✓ Schema Validation Layer
+  - JSON Schema for all tools
+  - Parameter name fuzzy-matching
+  - Vector coercion & type normalization
+  - Range validation & enum checking
+
+✓ Multi-layer Error Recovery
+  - Automatic LLM-based repair
+  - Exponential backoff retry (3x)
+  - Failure blacklist (12-turn window)
+  - Circuit breaker on consecutive failures
+
+✓ Knowledge Retrieval (RAG 2.0)
+  - Hybrid search: BM25 + vector embeddings
+  - 12 knowledge shards (SOP, DOP, recipes, etc.)
+  - Query expansion & synonym matching
+  - 700+ SOP documentation entries
+
+✓ Vision Integration
+  - Viewport screenshot capture
+  - Network editor analysis
+  - Semantic scoring (multi-view renders optional)
+  - Pixel-level comparison
+
+✓ Real-time UI
+  - PySide6 panel with streaming responses
+  - 3 detail modes (simple/intermediate/expert)
+  - Live job monitoring
+  - Auto-save panel state
+
+✓ Async Job Management
+  - Thread-safe job queue
+  - Stream callbacks (chunk updates)
+  - Done callbacks (completion notification)
+  - Multi-subscriber support
+
+✓ Advanced Simulation
+  - Pyro/FLIP/RBD/Vellum/Grain setup
+  - Solver parameter validation
+  - Common issue detection & repair
+  - AOV pass configuration
+
+✓ Asset Management (HDA)
+  - Network to HDA conversion
+  - Parameter promotion
+  - Version tracking
+  - Multi-asset workflows
+
+✓ Scene Analysis
+  - Deep error tracing (root cause analysis)
+  - Network profiling (slowest nodes)
+  - Spatial layout auditing
+  - VEX/Python validation
+
+=============================================================================
+KNOWN CAPABILITIES NOT YET EXPLORED
+=============================================================================
+
+Based on git status, these NEW files exist but weren't deeply analyzed:
+- data/knowledge/houdini_python_functions.json (new KB entry)
+- data/knowledge/houdinimind_agent_recipes.json (new recipes)
+- data/knowledge/vex_dataset_final_merged.jsonl (new VEX examples)
+- data/knowledge/vex_functions.db (new VEX database)
+- src/houdinimind/agent/scene_reference.py (scene ref detection)
+
+These likely contain:
+- Expanded HOM API documentation
+- New procedural recipes for furniture, food, etc.
+- VEX optimization snippets
+- VEX function reference library
+- Scene reference detection/validation
+
+=============================================================================
+POTENTIAL ENHANCEMENT OPPORTUNITIES
+=============================================================================
+
+Based on missing features in the codebase:
+
+1. COLLABORATIVE FEATURES
+   - Multi-user session support (requires node locking)
+   - Undo/redo integration with Houdini undo stack
+   - Conflict detection (warn on concurrent edits)
+   - Change broadcasting to external tools
+
+2. ADVANCED SIMULATION
+   - Constraint authoring UI
+   - ML-based CFL/substep auto-tuning
+   - Sim velocity/force visualization
+   - Interactive particle seeding
+
+3. RENDERING & LOOKDEV
+   - Real-time material preview
+   - AI-driven lighting placement
+   - Render farm integration
+   - Multi-view render composition
+
+4. DATA MANAGEMENT
+   - Asset library tagging system
+   - Intelligent cache lifecycle
+   - Scene version control (diff/merge)
+   - Dependency tracking visualization
+
+5. KNOWLEDGE IMPROVEMENTS
+   - Auto-learning from failures
+   - User-created recipe templates
+   - Houdini version-specific docs
+   - Custom knowledge base injection
+
+6. PROCEDURAL GENERATION
+   - Animation curve interpolation
+   - ML-based geometry synthesis
+   - Packed prim auto-conversion
+   - Instancing opportunity detection
+
+7. ADVANCED DEBUGGING
+   - Execution breakpoints
+   - Attribute timeline graphing
+   - Cook profile heatmap
+   - Bottleneck visualization
+
+8. PERFORMANCE FEATURES
+   - Incremental cook (only dirty nodes)
+   - GPU acceleration delegation
+   - Distributed TOP execution
+   - Memory optimization hints
+
+=============================================================================
+RECOMMENDED NEXT STEPS FOR FEATURE DEVELOPMENT
+=============================================================================
+
+1. Review FEATURE_OVERVIEW.md for comprehensive feature summary
+2. Review ARCHITECTURE_DIAGRAM.md for system design understanding
+3. Read data/core_config.json for configuration options
+4. Examine loop.py (offset-based) for agent orchestration logic
+5. Study tools/__init__.py to understand tool registration
+6. Check tools/_core.py for shared helper functions
+7. Review any relevant tools/ module for examples
+8. Check bridge/ for Houdini integration patterns
+9. Study rag/retriever.py for knowledge base querying
+10. Examine ui/_panel.py for UI patterns
+
+=============================================================================
+CONTACT & ATTRIBUTION
+=============================================================================
+
+Creator: Anshul Vashist
+Email: vashistanshul.7@gmail.com
+LinkedIn: https://www.linkedin.com/in/av-0001/
+
+License: Apache 2.0
+Python: 3.11+
+Houdini: 21.x
+Framework: Ollama (local-first)
+
+=============================================================================
+END OF EXPLORATION SUMMARY
+=============================================================================

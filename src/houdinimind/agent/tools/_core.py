@@ -19,7 +19,6 @@ import re
 import subprocess
 import tempfile
 import threading
-import time
 
 HOUDINIMIND_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 SCHEMA_PATH = os.path.join(HOUDINIMIND_ROOT, "data", "schema", "houdini_full_schema.json")
@@ -54,8 +53,8 @@ def _ok(data=None, message="OK"):
     return {"status": "ok", "message": message, "data": data}
 
 
-def _err(msg):
-    return {"status": "error", "message": msg, "data": None}
+def _err(msg, data=None):
+    return {"status": "error", "message": msg, "data": data}
 
 
 def _require_hou():
@@ -515,7 +514,7 @@ _PARM_BASE_ALIASES = {
     "columns": "cols",
     "density": "density",
     "amount": "amount",
-    "distance": "dist",
+    "distance": ("offset", "dist"),
 }
 
 _PARM_COMPONENT_ALIASES = {
@@ -714,11 +713,21 @@ def _get_search_retriever():
 
     config_path = os.path.join(HOUDINIMIND_ROOT, "data", "core_config.json")
     kb_path = _active_knowledge_base_path(HOUDINIMIND_ROOT)
+    vex_db_path = os.environ.get("HOUDINIMIND_VEX_FUNCTIONS_DB", "").strip() or os.path.join(
+        HOUDINIMIND_ROOT, "vex_functions.db"
+    )
+    python_json_path = os.environ.get(
+        "HOUDINIMIND_HOUDINI_PYTHON_JSON", ""
+    ).strip() or os.path.join(HOUDINIMIND_ROOT, "houdini_python_functions.json")
     cache_key = (
         HOUDINIMIND_ROOT,
         os.path.getmtime(config_path) if os.path.exists(config_path) else None,
         kb_path,
         os.path.getmtime(kb_path) if os.path.exists(kb_path) else None,
+        vex_db_path,
+        os.path.getmtime(vex_db_path) if os.path.exists(vex_db_path) else None,
+        python_json_path,
+        os.path.getmtime(python_json_path) if os.path.exists(python_json_path) else None,
         os.environ.get("HOUDINIMIND_NODE_CHAINS_PATH", ""),
         os.environ.get("HOUDINIMIND_HIGH_FIDELITY_PATH", ""),
         id(_shared_embed_fn) if callable(_shared_embed_fn) else None,
@@ -859,15 +868,25 @@ def _parm_alias_candidates(parm_name):
     if not lowered:
         return []
     candidates = [lowered]
+
+    def _add_mapped(mapped_val, suffix=""):
+        if isinstance(mapped_val, (list, tuple)):
+            for v in mapped_val:
+                candidates.append(f"{v}{suffix}")
+        else:
+            candidates.append(f"{mapped_val}{suffix}")
+
     mapped_base = _PARM_BASE_ALIASES.get(lowered)
     if mapped_base:
-        candidates.append(mapped_base)
+        _add_mapped(mapped_base)
+
     digit_match = re.search(r"(\D+)(\d+.*)$", lowered)
     if digit_match:
         base_part = digit_match.group(1)
         suffix_part = digit_match.group(2)
         if base_part in _PARM_BASE_ALIASES:
-            candidates.append(f"{_PARM_BASE_ALIASES[base_part]}{suffix_part}")
+            _add_mapped(_PARM_BASE_ALIASES[base_part], suffix_part)
+
     for suffix, mapped_suffix in sorted(
         _PARM_COMPONENT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True
     ):
@@ -879,7 +898,12 @@ def _parm_alias_candidates(parm_name):
         if not base:
             continue
         mapped_base = _PARM_BASE_ALIASES.get(base, base)
-        candidates.append(f"{mapped_base}{mapped_suffix}")
+        if isinstance(mapped_base, (list, tuple)):
+            for m_base in mapped_base:
+                candidates.append(f"{m_base}{mapped_suffix}")
+        else:
+            candidates.append(f"{mapped_base}{mapped_suffix}")
+
     if digit_match:
         base_part = digit_match.group(1)
         suffix_part = digit_match.group(2)
@@ -887,7 +911,13 @@ def _parm_alias_candidates(parm_name):
             for c_suffix, c_mapped in _PARM_COMPONENT_ALIASES.items():
                 if suffix_part.endswith(c_suffix):
                     naked_num = suffix_part[: -len(c_suffix)]
-                    candidates.append(f"{_PARM_BASE_ALIASES[base_part]}{naked_num}{c_mapped}")
+                    mapped_base = _PARM_BASE_ALIASES[base_part]
+                    if isinstance(mapped_base, (list, tuple)):
+                        for m_base in mapped_base:
+                            candidates.append(f"{m_base}{naked_num}{c_mapped}")
+                    else:
+                        candidates.append(f"{mapped_base}{naked_num}{c_mapped}")
+
     return _ordered_unique(candidates)
 
 
@@ -1054,6 +1084,29 @@ def _fuzzy_match_parameter(requested, pool, labels_by_name, node_type=""):
         return None
 
 
+def _fuzzy_match_node_type(requested, pool):
+    """Use the LLM to pick the best node type match from a pool of names."""
+    if not _shared_chat_simple_fn:
+        return None
+    try:
+        system_prompt = (
+            "You are a Houdini Expert.\n"
+            "Given a requested node type and a list of valid node types, "
+            "pick the one that MOST CLOSELY matches the intent.\n"
+            "Return ONLY the internal node type name, no quotes, no explanation.\n"
+            "If no match is close enough, return 'NONE'."
+        )
+        user_prompt = f"Requested: {requested}\nPool: {pool[:200]}"
+        match = _shared_chat_simple_fn(
+            system=system_prompt, user=user_prompt, temperature=0.1, task="quick"
+        ).strip()
+        if match == "NONE":
+            return None
+        return match
+    except Exception:
+        return None
+
+
 def _resolve_node_type_name(node_type, available_node_types=None, aliases=None):
     requested = str(node_type or "").strip()
     if not requested:
@@ -1106,6 +1159,17 @@ def _resolve_node_type_name(node_type, available_node_types=None, aliases=None):
             "resolved": alias,
             "reason": "alias",
         }
+
+    if available and _shared_chat_simple_fn:
+        fuzzy_match = _fuzzy_match_node_type(requested, available)
+        if fuzzy_match and fuzzy_match in available_lower.values():
+            return {
+                "status": "resolved",
+                "requested": requested,
+                "resolved": fuzzy_match,
+                "reason": "llm_fuzzy_match",
+            }
+
     return {
         "status": "unresolved",
         "requested": requested,
@@ -1222,18 +1286,22 @@ def _validate_vex_with_checker(vex_code):
     vcc_res = _validate_vex_with_vcc(vex_code)
     if vcc_res.get("status") == "ok":
         return vcc_res
+    temp_geo = None
     try:
         if not HOU_AVAILABLE:
             return {"success": False, "errors": ["hou not available"], "warnings": []}
         parent = hou.node("/obj")
+        if not parent:
+            return {"success": False, "errors": ["/obj not found"], "warnings": []}
         checker_name = "__HOUDINIMIND_VEX_CHECKER__"
-        checker = parent.node(checker_name)
-        if not checker:
-            temp_geo = parent.node("__HOUDINIMIND_TEMP_GEO__")
-            if not temp_geo:
-                temp_geo = parent.createNode("geo", "__HOUDINIMIND_TEMP_GEO__")
-                temp_geo.hide(True)
-            checker = temp_geo.createNode("attribwrangle", checker_name)
+        temp_geo = parent.node("__HOUDINIMIND_TEMP_GEO__")
+        if not temp_geo:
+            temp_geo = parent.createNode("geo", "__HOUDINIMIND_TEMP_GEO__")
+        try:
+            temp_geo.hide(True)
+        except Exception:
+            pass
+        checker = temp_geo.createNode("attribwrangle", checker_name)
         snippet_parm = checker.parm("snippet")
         if not snippet_parm:
             return {
@@ -1260,6 +1328,33 @@ def _validate_vex_with_checker(vex_code):
             "errors": [f"Validation system error: {e!s}"],
             "warnings": [],
         }
+    finally:
+        if temp_geo is not None:
+            try:
+                temp_geo.destroy(disable_safety_checks=True)
+            except TypeError:
+                try:
+                    temp_geo.destroy()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+
+def _vex_validation_unavailable(validation_result):
+    """Return True when validation failed because no checker/compiler is available."""
+    if not isinstance(validation_result, dict):
+        return False
+    if validation_result.get("status") == "compiler_not_found":
+        return True
+    errors = " ".join(str(err) for err in validation_result.get("errors") or [])
+    unavailable_markers = (
+        "hou not available",
+        "compiler_not_found",
+        "could not find snippet parm on checker node",
+        "validation system error",
+    )
+    return any(marker in errors.lower() for marker in unavailable_markers)
 
 
 def _validate_python_code(code):

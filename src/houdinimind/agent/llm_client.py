@@ -38,10 +38,10 @@ try:
 except ImportError:
     _HTTPX_AVAILABLE = False
 
-from .tool_selection import (
-    _TOOL_KEYWORD_MAP,
-    select_relevant_tool_schemas,
-)
+from . import tool_selection as _tool_selection
+
+_TOOL_KEYWORD_MAP = _tool_selection._TOOL_KEYWORD_MAP
+select_relevant_tool_schemas = _tool_selection.select_relevant_tool_schemas
 
 OLLAMA_BASE = "http://localhost:11434"
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
@@ -691,13 +691,20 @@ class OllamaClient:
         Stream Ollama's response line-by-line so that cancel_active_requests()
         can interrupt mid-generation instead of waiting for the full response.
         """
+        effective_model = model_override or self.model
+        effective_ctx = self.context_window
+        # Cloud-proxy models (e.g. gemma4:31b-cloud) crash with HTTP 500
+        # when num_ctx exceeds ~32k. Cap automatically to prevent this.
+        _CLOUD_CTX_CAP = 32768
+        if ":cloud" in effective_model.lower() and effective_ctx > _CLOUD_CTX_CAP:
+            effective_ctx = _CLOUD_CTX_CAP
         payload = {
-            "model": model_override or self.model,
+            "model": effective_model,
             "messages": messages,
             "stream": True,  # ← streaming enabled for fast cancel
             "options": {
                 "temperature": self.temperature,
-                "num_ctx": self.context_window,
+                "num_ctx": effective_ctx,
             },
         }
         if tools:
@@ -1309,7 +1316,8 @@ class OllamaClient:
                 method="POST",
             )
             parts: list[str] = []
-            with urllib.request.urlopen(req, timeout=None) as resp:
+            silence_s = float(self.config.get("stream_silence_s", 60.0))
+            with urllib.request.urlopen(req, timeout=silence_s) as resp:
                 for line in resp:
                     if not line or not line.strip():
                         continue
@@ -1430,7 +1438,8 @@ class OllamaClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=None) as resp:
+                silence_s = float(self.config.get("stream_silence_s", 60.0))
+                with urllib.request.urlopen(req, timeout=silence_s) as resp:
                     for line in resp:
                         if line.strip():
                             try:

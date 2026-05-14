@@ -5,6 +5,8 @@
 # ==============================================================================
 import json
 import os
+import queue
+import ssl
 import threading
 import traceback
 
@@ -16,10 +18,19 @@ except ImportError:
     hou = None
 
 
-class PanelBackendMixin:
-    def _urlopen_with_ssl_fallback(self, req, timeout: int):
-        import ssl
+_SHARED_BACKEND_LOCK = threading.Lock()
+_SHARED_BACKEND: dict[str, object] = {}
 
+
+class PanelBackendMixin:
+    def _record_startup_issue(self, subsystem: str, exc: Exception | str) -> None:
+        issues = getattr(self, "_startup_issues", None)
+        if issues is None:
+            issues = []
+            self._startup_issues = issues
+        issues.append({"subsystem": subsystem, "error": str(exc)})
+
+    def _urlopen_with_ssl_fallback(self, req, timeout: int):
         try:
             import certifi
 
@@ -40,12 +51,14 @@ class PanelBackendMixin:
             )
 
     def _setup_backend(self):
+        self._startup_issues = []
         try:
             self._config_path = os.path.join(HOUDINIMIND_ROOT, "data", "core_config.json")
             with open(self._config_path) as f:
                 self.config = json.load(f)
         except Exception as e:
             print(f"Config load failed: {e}")
+            self._record_startup_issue("Config", e)
             self.config = {}
             self._config_path = os.path.join(HOUDINIMIND_ROOT, "data", "core_config.json")
 
@@ -53,6 +66,28 @@ class PanelBackendMixin:
         if not data_dir or data_dir == "__auto__" or not os.path.isdir(data_dir):
             data_dir = os.path.join(HOUDINIMIND_ROOT, "data")
             self.config["data_dir"] = data_dir
+        # UI startup must stay light. Building the RAG retriever can parse large
+        # corpora and hold the GIL long enough to make Houdini look frozen, so
+        # the panel path defers it until the first agent turn that needs it.
+        self.config.setdefault("defer_rag_startup", True)
+
+        with _SHARED_BACKEND_LOCK:
+            shared_agent = _SHARED_BACKEND.get("agent")
+            shared_job_manager = _SHARED_BACKEND.get("job_manager")
+            if shared_agent is not None and shared_job_manager is not None:
+                self.config = dict(_SHARED_BACKEND.get("config") or self.config)
+                self.memory = _SHARED_BACKEND.get("memory")
+                self.agent = shared_agent
+                self.job_manager = shared_job_manager
+                self._research_scheduler = _SHARED_BACKEND.get("research_scheduler")
+                self._skill_loader = _SHARED_BACKEND.get("skill_loader")
+                self._startup_issues = list(_SHARED_BACKEND.get("startup_issues") or [])
+                try:
+                    self.agent.on_tool_call = self._on_tool_call_from_agent
+                    self.agent.set_confirmation_callback(self.sig_confirm_request.emit)
+                except Exception:
+                    pass
+                return
 
         import time as _time
 
@@ -71,15 +106,20 @@ class PanelBackendMixin:
             )
         except Exception as e:
             print(f"MemoryManager unavailable: {e}")
+            self._record_startup_issue("Memory", e)
         _time.sleep(0)  # yield GIL after MemoryManager
 
         rag_injector = None
-        try:
-            from houdinimind.rag import create_rag_pipeline
+        if self.config.get("defer_rag_startup", False):
+            print("[HoudiniMind] RAG startup deferred until first use.")
+        else:
+            try:
+                from houdinimind.rag import create_rag_pipeline
 
-            rag_injector = create_rag_pipeline(self.config.get("data_dir", ""), self.config)
-        except Exception as e:
-            print(f"RAG unavailable: {e}")
+                rag_injector = create_rag_pipeline(self.config.get("data_dir", ""), self.config)
+            except Exception as e:
+                print(f"RAG unavailable: {e}")
+                self._record_startup_issue("RAG", e)
         _time.sleep(0)  # yield GIL after RAG pipeline (FAISS/model load)
 
         try:
@@ -101,6 +141,7 @@ class PanelBackendMixin:
             self.agent.set_confirmation_callback(self.sig_confirm_request.emit)
         except Exception as e:
             print(f"AgentLoop error: {e}")
+            self._record_startup_issue("Agent", e)
             traceback.print_exc()
         _time.sleep(0)  # yield GIL after AgentLoop
 
@@ -119,6 +160,7 @@ class PanelBackendMixin:
                 self._research_scheduler.start()
         except Exception as e:
             print(f"[HoudiniMind] ResearchScheduler init failed: {e}")
+            self._record_startup_issue("Scheduler", e)
         _time.sleep(0)  # yield GIL after ResearchScheduler
 
         # ── Skills Platform ───────────────────────────────────────────────
@@ -141,7 +183,21 @@ class PanelBackendMixin:
                 )
         except Exception as e:
             print(f"[HoudiniMind] SkillLoader init failed: {e}")
+            self._record_startup_issue("Skills", e)
         _time.sleep(0)  # yield GIL after SkillLoader
+
+        with _SHARED_BACKEND_LOCK:
+            _SHARED_BACKEND.update(
+                {
+                    "config": dict(self.config or {}),
+                    "memory": getattr(self, "memory", None),
+                    "agent": getattr(self, "agent", None),
+                    "job_manager": getattr(self, "job_manager", None),
+                    "research_scheduler": getattr(self, "_research_scheduler", None),
+                    "skill_loader": getattr(self, "_skill_loader", None),
+                    "startup_issues": list(getattr(self, "_startup_issues", []) or []),
+                }
+            )
 
     def _ensure_schema(self, data_dir: str):
         schema_path = os.path.join(data_dir, "schema", "houdini_full_schema.json")
@@ -177,6 +233,7 @@ class PanelBackendMixin:
             self.event_hooks.register()
         except Exception as e:
             print(f"EventHooks failed: {e}")
+            self._record_startup_issue("Event Hooks", e)
         # ── HipFile save event → learning cycle ───────────────────────────
         try:
             import hou
@@ -185,6 +242,7 @@ class PanelBackendMixin:
             print("[HoudiniMind] HipFile event callback registered.")
         except Exception as e:
             print(f"[HoudiniMind] HipFile event callback failed: {e}")
+            self._record_startup_issue("HipFile Events", e)
 
     def _on_hip_file_event(self, event_type):
         """
@@ -298,6 +356,7 @@ class PanelBackendMixin:
             from ._asr import SpeechToTextController
         except Exception as exc:
             print(f"Speech input unavailable: {exc}")
+            self._record_startup_issue("Speech", exc)
             if hasattr(self, "mic_btn"):
                 self.mic_btn.setEnabled(False)
                 self.mic_btn.setToolTip("Speech input unavailable")
@@ -357,6 +416,7 @@ class PanelBackendMixin:
         self.config["turn_checkpoints"] = bool(cfg.get("auto_backup", False))
         self.config["vision_enabled"] = True
 
+        # SECURITY: save API key to secure credential store, not plaintext config
         raw_api_key = cfg.get("api_key", "").strip()
         if raw_api_key:
             try:
@@ -364,10 +424,13 @@ class PanelBackendMixin:
 
                 cred = CredentialStore(self.config.get("data_dir", ""))
                 cred.save_api_key(raw_api_key)
+                # Keep in memory for the current session but strip before disk save
                 self.config["api_key"] = raw_api_key
-            except Exception:
+            except Exception as e:
+                print(f"[HoudiniMind] Secure credential save failed: {e}")
                 self.config["api_key"] = raw_api_key
         else:
+            # User cleared the key — remove from secure store too
             try:
                 from houdinimind.agent.credential_store import CredentialStore
 
@@ -397,19 +460,61 @@ class PanelBackendMixin:
         if not path:
             return
         try:
+            # SECURITY: never persist api_key as plaintext in the JSON config.
+            # It lives in the OS keyring / encrypted credential file instead.
             save_config = dict(self.config)
-            save_config["api_key"] = ""
+            save_config["api_key"] = ""  # always blank on disk
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(save_config, f, indent=2)
         except Exception as e:
             print(f"Config save failed: {e}")
 
     def _on_scene_event(self, category: str, data: dict):
-        if self.memory:
+        # FX-FREEZE: this runs inside Houdini's nodeEventCallback on the main
+        # thread. memory.log_scene_event opens a SQLite connection and INSERTs,
+        # which blocked Houdini's UI on every FlagChanged / NameChanged /
+        # ChildCreated event — i.e. for ordinary panning, selecting, and
+        # display-flag toggles. Push to a queue and let a single daemon thread
+        # drain into SQLite so the main thread returns instantly.
+        if not self.memory:
+            return
+        q = self._ensure_scene_event_queue()
+        try:
+            q.put_nowait((category, data))
+        except queue.Full:
+            # Drop the oldest event rather than block the main thread.
             try:
-                self.memory.log_scene_event(category, data)
+                q.get_nowait()
+                q.put_nowait((category, data))
             except Exception:
                 pass
+
+    def _ensure_scene_event_queue(self) -> "queue.Queue":
+        q = getattr(self, "_scene_event_queue", None)
+        if q is not None:
+            return q
+        q = queue.Queue(maxsize=2048)
+        self._scene_event_queue = q
+
+        def _drain():
+            while True:
+                try:
+                    item = q.get()
+                except Exception:
+                    return
+                if item is None:
+                    return
+                cat, data = item
+                try:
+                    if self.memory:
+                        self.memory.log_scene_event(cat, data)
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_drain, daemon=True, name="hmind-scene-events")
+        t.start()
+        self._scene_event_thread = t
+        return q
         # Scene error detection removed — sig_scene_error was disconnected from
         # the UI banner and the emission loop ran for nothing on every event.
         # Re-enable here if the error banner is reconnected in the future.

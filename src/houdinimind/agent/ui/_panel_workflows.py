@@ -42,7 +42,15 @@ class PanelWorkflowMixin:
         try:
             from houdinimind.bridge.scene_reader import SceneReader
 
-            scene_json = SceneReader().snapshot_json()
+            scene_json = SceneReader(
+                max_nodes=120 if silent else 180,
+                max_parms_per_node=8 if silent else 12,
+                include_cook_hotspots=False,
+                include_dop_summary=False,
+                include_usd_summary=False,
+                include_material_assignments=False,
+                traversal_time_budget_s=0.75 if silent else 1.25,
+            ).snapshot_json()
             self.agent.inject_scene_context(scene_json)
             if not silent:
                 summary = "📡 Scene context injected — agent now has live scene state."
@@ -561,6 +569,46 @@ class PanelWorkflowMixin:
                 if content:
                     self._add_msg(role, content, _restoring=True)
 
+    def _restore_active_job_ui(self):
+        manager = getattr(self, "job_manager", None)
+        if manager is None or getattr(self, "_busy", False):
+            return
+        try:
+            job = manager.latest_active()
+        except Exception:
+            job = None
+        if not job:
+            return
+
+        meta = job.get("meta") or {}
+        mode = str(meta.get("mode") or job.get("kind") or "chat")
+        dry_run = bool(meta.get("dry_run", False))
+        user_text = str(meta.get("user_text") or "").strip()
+        self._active_job_id = str(job.get("job_id") or "")
+        self._current_mode = mode
+        self._current_dry_run = dry_run
+
+        if not self._has_conversation_content and user_text:
+            self._add_msg("user", user_text, mode, _restoring=True)
+
+        self._current_bubble = self._add_msg("agent", "", mode, _restoring=True)
+        self._begin_turn_ui(user_text or "Restored active turn", mode, dry_run=dry_run)
+        self._set_busy(True)
+
+        for chunk in job.get("stream_log") or []:
+            self._on_chunk(str(chunk or ""))
+        self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
+
+        try:
+            self._active_job_subscription = manager.subscribe(
+                self._active_job_id,
+                stream_callback=self.sig_stream_chunk.emit,
+                done_callback=self.sig_response_done.emit,
+            )
+        except Exception:
+            self._active_job_subscription = ""
+        self._refresh_turn_status("Reconnected to the running agent turn.")
+
     def _add_msg(
         self, role: str, text: str, mode: str = "chat", _restoring: bool = False
     ) -> MessageBubble:
@@ -626,8 +674,29 @@ class PanelWorkflowMixin:
         self.mode_label.setText(msg)
         self._refresh_turn_status(msg)
 
+    def _show_startup_diagnostics(self):
+        issues = getattr(self, "_startup_issues", []) or []
+        if not issues:
+            return
+        lines = ["Startup completed with issues:"]
+        for issue in issues[:6]:
+            subsystem = issue.get("subsystem", "Startup")
+            error = str(issue.get("error", "")).strip()
+            if len(error) > 180:
+                error = error[:177].rstrip() + "..."
+            lines.append(f"- {subsystem}: {error}")
+        if len(issues) > 6:
+            lines.append(f"- {len(issues) - 6} more issue(s) in the debug log.")
+        self._add_status_notice("\n".join(lines), tone="warning")
+        self._refresh_turn_status("Startup completed with diagnostics to review.")
+
     def _set_busy(self, busy: bool):
         self._busy = busy
+        if not busy:
+            self._cancel_pending = False
+            if hasattr(self, "stop_btn"):
+                self.stop_btn.setEnabled(True)
+                self.stop_btn.setText("■")
         # Legacy strip is intentionally hidden from UI.
         if hasattr(self, "turn_strip"):
             self.turn_strip.setVisible(False)
@@ -670,23 +739,20 @@ class PanelWorkflowMixin:
         self._refresh_action_availability()
 
     def _on_stop(self):
+        if not self._busy and not self._autoresearch_running:
+            return
+        self._cancel_pending = True
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled(False)
+            self.stop_btn.setText("...")
+        self._show_status("Stopping at the next safe checkpoint...")
+        self._refresh_turn_status("Stopping at the next safe checkpoint...")
+
         # 1. Signal the agent thread to stop ASAP
         if self._autoresearch_running:
             self._stop_autoresearch()
         if self.agent:
             self.agent.cancel()
-
-        # 2. Reset UI — agent.cancel() sets the cancel event so the background
-        #    thread will exit at its next checkpoint.  We must clear _busy now
-        #    so the user can immediately issue a new request.
-        self._set_busy(False)
-        self._hide_status()
-        self.stop_btn.setVisible(False)
-        self.send_btn.setVisible(True)
-        self.input_box.setEnabled(True)
-
-        self._add_system_note("⏹ Stopped.")
-        self._refresh_turn_status("Stopped.")
 
     def _on_undo(self):
         if self._busy:
@@ -746,7 +812,19 @@ class PanelWorkflowMixin:
                 params = []
                 for parm in node.parms()[:10]:
                     try:
-                        params.append(f"{parm.name()}: {parm.eval()}")
+                        value = ""
+                        for reader in (
+                            getattr(parm, "unexpandedString", None),
+                            getattr(parm, "rawValue", None),
+                        ):
+                            if reader is None:
+                                continue
+                            try:
+                                value = str(reader())
+                                break
+                            except Exception:
+                                continue
+                        params.append(f"{parm.name()}: {value}")
                     except Exception:
                         pass
                 ctx.append(f"- {node.path()} ({node.type().name()}) Params: {', '.join(params)}")
@@ -755,6 +833,15 @@ class PanelWorkflowMixin:
             return ""
 
     def closeEvent(self, event):
+        if hasattr(self, "_persist_panel_state"):
+            self._persist_panel_state()
+        token = getattr(self, "_active_job_subscription", "")
+        job_id = getattr(self, "_active_job_id", "")
+        if token and job_id and getattr(self, "job_manager", None):
+            try:
+                self.job_manager.unsubscribe(job_id, token)
+            except Exception:
+                pass
         if getattr(self, "_asr_controller", None):
             try:
                 self._asr_controller.stop()

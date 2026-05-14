@@ -3,12 +3,7 @@
 # Email: vashistanshul.7@gmail.com
 # LinkedIn: https://www.linkedin.com/in/av-0001/
 # ==============================================================================
-"""
-Tool selection helpers for LLM clients.
-
-Keeps keyword maps and relevance scoring out of the transport client so the
-core client file stays smaller.
-"""
+"""Tool selection helpers for LLM clients."""
 
 import copy
 import re
@@ -36,8 +31,6 @@ _TOOL_KEYWORD_MAP = {
         "verify_node_type",
         "resolve_build_hints",
         "safe_set_parameter",
-        "connect_nodes",
-        "set_display_flag",
         "layout_network",
     ],
     "build": [
@@ -92,45 +85,34 @@ _TOOL_KEYWORD_MAP = {
     "normal": ["check_geometry_issues", "search_knowledge"],
     "bounding": ["get_bounding_box"],
     "sim": [
-        "setup_flip_fluid",
-        "setup_pyro_sim",
-        "setup_rbd_fracture",
-        "setup_vellum_cloth",
+        "get_simulation_diagnostic",
         "get_dop_objects",
         "get_sim_stats",
+        "search_knowledge",
     ],
     "simulation": [
+        "get_simulation_diagnostic",
         "get_dop_objects",
         "get_sim_stats",
         "get_flip_diagnostic",
         "bake_simulation",
+        "search_knowledge",
     ],
-    "flip": ["setup_flip_fluid", "get_flip_diagnostic", "get_dop_objects"],
-    "fluid": ["setup_flip_fluid", "get_flip_diagnostic"],
-    "water": ["setup_flip_fluid", "search_knowledge"],
-    "pyro": ["setup_pyro_sim", "get_simulation_diagnostic", "get_sim_stats", "search_knowledge"],
-    "fire": ["setup_pyro_sim", "search_knowledge"],
-    "smoke": ["setup_pyro_sim", "search_knowledge"],
-    "rbd": ["setup_rbd_fracture", "get_dop_objects"],
-    "fracture": ["setup_rbd_fracture", "search_knowledge"],
-    "destroy": ["setup_rbd_fracture", "search_knowledge"],
-    "vellum": ["setup_vellum_cloth", "search_knowledge"],
-    "cloth": ["setup_vellum_cloth", "search_knowledge"],
-    "bed": [
-        "create_bed_controls",
-        "create_node_chain",
-        "setup_vellum_pillow",
-        "setup_vellum_cloth",
-    ],
-    "mattress": [
-        "create_bed_controls",
-        "create_node",
-        "safe_set_parameter",
-        "create_node_chain",
-    ],
-    "pillow": ["create_node", "setup_vellum_pillow", "setup_vellum_cloth"],
+    "flip": ["get_flip_diagnostic", "get_dop_objects", "search_knowledge"],
+    "fluid": ["get_flip_diagnostic", "search_knowledge"],
+    "water": ["search_knowledge", "get_geometry_attributes"],
+    "pyro": ["get_simulation_diagnostic", "get_sim_stats", "search_knowledge"],
+    "fire": ["search_knowledge", "get_simulation_diagnostic"],
+    "smoke": ["search_knowledge", "get_simulation_diagnostic"],
+    "rbd": ["get_simulation_diagnostic", "get_dop_objects", "search_knowledge"],
+    "fracture": ["get_simulation_diagnostic", "search_knowledge"],
+    "destroy": ["get_simulation_diagnostic", "search_knowledge"],
+    "vellum": ["get_simulation_diagnostic", "search_knowledge"],
+    "cloth": ["get_simulation_diagnostic", "search_knowledge"],
+    "pop": ["get_sim_stats", "get_dop_objects", "search_knowledge"],
+    "particle": ["get_sim_stats", "get_dop_objects", "search_knowledge"],
+    "particles": ["get_sim_stats", "get_dop_objects", "search_knowledge"],
     "fabric": ["setup_fabric_lookdev", "create_uv_seams", "get_vex_snippet"],
-    "duvet": ["create_bed_controls", "setup_vellum_cloth", "setup_fabric_lookdev"],
     "bake": ["bake_simulation"],
     "material": ["create_material", "assign_material", "list_materials"],
     "shader": ["create_material", "assign_material", "list_materials"],
@@ -193,13 +175,11 @@ _TOOL_KEYWORD_MAP = {
         "inspect_display_output",
         "finalize_sop_network",
         "set_display_flag",
-        "capture_pane",
     ],
     "final": [
         "inspect_display_output",
         "finalize_sop_network",
         "set_display_flag",
-        "capture_pane",
     ],
     "merge": ["create_node_chain", "connect_nodes", "finalize_sop_network"],
     "spatial": ["audit_spatial_layout", "get_bounding_box"],
@@ -209,7 +189,6 @@ _TOOL_KEYWORD_MAP = {
         "get_scene_summary",
         "create_node",
         "safe_set_parameter",
-        "connect_nodes",
         "verify_node_type",
         "layout_network",
         "get_node_parameters",
@@ -218,8 +197,6 @@ _TOOL_KEYWORD_MAP = {
         "audit_spatial_layout",
         "batch_set_parameters",
         "create_node_chain",
-        "set_display_flag",
-        "finalize_sop_network",
         "save_hip",
     ],
 }
@@ -244,7 +221,7 @@ def select_relevant_tool_schemas(
     allow_execute_python = bool(_PYTHON_TOOL_HINT_RE.search(query or ""))
 
     schema_by_name = {s.get("function", {}).get("name"): s for s in all_schemas}
-    selected_names: list = list(_TOOL_KEYWORD_MAP["_always"])
+    selected_names: list = []
 
     for keyword, tools in _TOOL_KEYWORD_MAP.items():
         if keyword == "_always":
@@ -253,6 +230,9 @@ def select_relevant_tool_schemas(
             for t in tools:
                 if t not in selected_names:
                     selected_names.append(t)
+    for t in _TOOL_KEYWORD_MAP["_always"]:
+        if t not in selected_names:
+            selected_names.append(t)
 
     if len(selected_names) < top_n:
         remaining = [n for n in schema_by_name if n not in selected_names]
@@ -280,7 +260,9 @@ def select_relevant_tool_schemas(
     strip_descs = bool(config.get("schema_strip_descriptions", False))
 
     result = []
-    for name in selected_names[:top_n]:
+    for name in selected_names:
+        if len(result) >= top_n:
+            break
         if name in schema_by_name:
             schema = copy.deepcopy(schema_by_name[name])
             if strip_descs:

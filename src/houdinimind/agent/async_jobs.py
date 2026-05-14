@@ -22,6 +22,7 @@ class AgentJobState:
     finished_at: float = 0.0
     latest_substate: str = ""
     progress_log: list[str] = field(default_factory=list)
+    stream_log: list[str] = field(default_factory=list)
     checkpoints: list[str] = field(default_factory=list)
     result: str = ""
     error: str = ""
@@ -36,6 +37,7 @@ class AgentJobState:
             "finished_at": self.finished_at,
             "latest_substate": self.latest_substate,
             "progress_log": list(self.progress_log),
+            "stream_log": list(self.stream_log),
             "checkpoints": list(self.checkpoints),
             "result": self.result,
             "error": self.error,
@@ -44,9 +46,12 @@ class AgentJobState:
 
 
 class AsyncJobManager:
-    def __init__(self, max_progress_entries: int = 80):
+    def __init__(self, max_progress_entries: int = 80, max_stream_entries: int = 1200):
         self._max_progress_entries = max(10, int(max_progress_entries))
+        self._max_stream_entries = max(50, int(max_stream_entries))
         self._jobs: dict[str, AgentJobState] = {}
+        self._stream_subscribers: dict[str, dict[str, Callable[[str], None]]] = {}
+        self._done_subscribers: dict[str, dict[str, Callable[[str], None]]] = {}
         self._lock = threading.Lock()
 
     def submit(
@@ -55,19 +60,24 @@ class AsyncJobManager:
         runner: Callable[[Callable[[str], None], Callable[[dict], None]], str],
         stream_callback: Callable[[str], None] | None = None,
         done_callback: Callable[[str], None] | None = None,
+        meta: dict | None = None,
     ) -> str:
         job_id = uuid.uuid4().hex[:12]
         job = AgentJobState(job_id=job_id, kind=kind)
+        if meta:
+            job.meta.update(dict(meta))
         with self._lock:
             self._jobs[job_id] = job
+        if stream_callback or done_callback:
+            self.subscribe(job_id, stream_callback=stream_callback, done_callback=done_callback)
 
         def _record_progress(chunk: str):
             text = str(chunk or "")
+            self._record_stream(job_id, text)
             message = text.replace("\x00AGENT_PROGRESS\x00", "").replace("\u200b", "").strip()
             if message:
                 self._record_substate(job_id, message)
-            if stream_callback:
-                stream_callback(text)
+            self._dispatch_stream(job_id, text)
 
         def _record_status(payload: dict):
             payload = dict(payload or {})
@@ -78,16 +88,14 @@ class AsyncJobManager:
             try:
                 result = runner(_record_progress, _record_status)
                 self._finish(job_id, status="completed", result=result)
-                if done_callback:
-                    done_callback(result)
+                self._dispatch_done(job_id, result)
             except Exception as exc:
                 error_text = f"⚠️ Agent Error: {exc}"
                 traceback.print_exc()
                 self._finish(job_id, status="failed", error=error_text)
-                if stream_callback:
-                    stream_callback(f"\n\n{error_text}")
-                if done_callback:
-                    done_callback(error_text)
+                self._record_stream(job_id, f"\n\n{error_text}")
+                self._dispatch_stream(job_id, f"\n\n{error_text}")
+                self._dispatch_done(job_id, error_text)
 
         # ALWAYS use threading.Thread instead of QThreadPool/QRunnable.
         # Running hdefereval from a locked QRunnable blocks PySide's event loop on Mac,
@@ -96,10 +104,75 @@ class AsyncJobManager:
 
         return job_id
 
+    def subscribe(
+        self,
+        job_id: str,
+        stream_callback: Callable[[str], None] | None = None,
+        done_callback: Callable[[str], None] | None = None,
+    ) -> str:
+        token = uuid.uuid4().hex[:12]
+        with self._lock:
+            if stream_callback:
+                self._stream_subscribers.setdefault(job_id, {})[token] = stream_callback
+            if done_callback:
+                self._done_subscribers.setdefault(job_id, {})[token] = done_callback
+        return token
+
+    def unsubscribe(self, job_id: str, token: str) -> None:
+        with self._lock:
+            self._stream_subscribers.get(job_id, {}).pop(token, None)
+            self._done_subscribers.get(job_id, {}).pop(token, None)
+
     def get(self, job_id: str) -> dict | None:
         with self._lock:
             job = self._jobs.get(job_id)
             return job.to_dict() if job else None
+
+    def latest_active(self) -> dict | None:
+        with self._lock:
+            active = [
+                job
+                for job in self._jobs.values()
+                if job.status in {"queued", "running"} and not job.finished_at
+            ]
+            if not active:
+                return None
+            return max(active, key=lambda job: job.started_at or 0.0).to_dict()
+
+    def _record_stream(self, job_id: str, chunk: str) -> None:
+        if not chunk:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.stream_log.append(str(chunk))
+            if len(job.stream_log) > self._max_stream_entries:
+                job.stream_log = job.stream_log[-self._max_stream_entries :]
+
+    def _dispatch_stream(self, job_id: str, chunk: str) -> None:
+        with self._lock:
+            callbacks = list(self._stream_subscribers.get(job_id, {}).items())
+        dead = []
+        for token, callback in callbacks:
+            try:
+                callback(chunk)
+            except Exception:
+                dead.append(token)
+        for token in dead:
+            self.unsubscribe(job_id, token)
+
+    def _dispatch_done(self, job_id: str, result: str) -> None:
+        with self._lock:
+            callbacks = list(self._done_subscribers.get(job_id, {}).items())
+        dead = []
+        for token, callback in callbacks:
+            try:
+                callback(result)
+            except Exception:
+                dead.append(token)
+        for token in dead:
+            self.unsubscribe(job_id, token)
 
     def _set_status(self, job_id: str, status: str):
         with self._lock:

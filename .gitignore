@@ -54,9 +54,11 @@ data/knowledge/*.generated.json
 data/knowledge/*.vectors.json
 data/knowledge/processed/
 data/db/*.db
+data/db/*.enc
 reports/
 
 # Scratch test artefacts (auto-regenerated, timestamp changes every run)
+scratch/
 tests/scratch/
 tests/scratch/**/*.vectors.json
 

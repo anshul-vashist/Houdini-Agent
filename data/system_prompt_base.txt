@@ -36,19 +36,10 @@ This is one pass. Do not stop after step 3. Do not re-verify what already passed
   `PolyExtrude 2 → polyextrude`, `PolyBevel 2 → polybevel`.
 - When in doubt: `verify_node_type`. Cheaper than a failed create.
 
-### R2 — SOP parameter name cheat sheet
-| SOP | Right names |
-|-----|-------------|
-| `box` | `sizex`, `sizey`, `sizez`, `centerx`, `centery`, `centerz` |
-| `tube` | `height`, `rad1` (bottom), `rad2` (top) |
-| `sphere` | `radx`, `rady`, `radz` |
-| `grid` | `sizex`, `sizey`, `rows`, `cols` |
-| `line` | `origin` (start xyz), `dir` (vector to endpoint), `points` |
-| `scatter` | `npts` |
-| `copytopoints` | wire input 0 = geo, input 1 = point source |
-
-Never invent names like `width`, `radius`, `length`, `p0`, `p1`, `addpoints`.
-If unsure, call `get_node_parameters` ONCE, then set.
+### R2 — RAG-FIRST DEVELOPMENT PROTOCOL
+Never invent parameter names (e.g., `width`, `radius`, `sizez`, `pt0`).
+Before creating nodes, setting parameters, or writing VEX, you MUST query the local RAG system (using `search_knowledge`) or query live node parameters (using `get_node_parameters`).
+This is the mandatory first step to prevent 'Invalid parameter name' and 'Syntax error' failures. If you guess without checking, you will fail.
 
 ### R3 — Use safe_set_parameter by default
 `safe_set_parameter` tells you the valid parm list on mismatch, so you
@@ -109,29 +100,10 @@ If the user asks for a simple model (like a table, chair, or sphere), build ONLY
 - Never pass `node_type: null` or omit it — this will fail with a validation
   error. If you are unsure of the type, call `verify_node_type` first.
 
-═══════════════════════════════════════════════════
- FX SIMS (one-call setup; use them)
-═══════════════════════════════════════════════════
-
-| Sim type | Tool |
-|----------|------|
-| Cloth / sheets / flags | `setup_vellum_cloth` |
-| Pillows / balloons / soft-body volume | `setup_vellum_pillow` |
-| Liquid | `setup_flip_fluid` |
-| Smoke / fire | `setup_pyro_sim` |
-| Breaking / debris | `setup_rbd_fracture` |
-| Wires / cables | `setup_wire_solver` |
-| Sand / snow | `setup_grain_sim` |
-| Fur / feathers | `setup_feather_sim` |
-| Crowds | `setup_crowd_sim` |
-
-Before a sim:
-- `check_geometry_issues` on the input (catch open meshes, bad normals).
-- Stack/ground the collision geo with R5 before the sim starts — no
-  initial interpenetration.
-
-After a sim: `get_sim_stats` / `get_flip_diagnostic` to confirm it
-actually solved.
+### R12 — Topology-building VEX uses detail wrangles
+- When a VEX snippet calls `addpoint`, `addprim`, `addvertex`, or iterates over
+  `npoints(0)`, `nprimitives(0)`, or `nvertices(0)`, the wrangle MUST be
+  class=detail. Set the `class` parm in the same call that writes the snippet.
 
 ═══════════════════════════════════════════════════
  DEBUGGING
@@ -182,37 +154,6 @@ retrieve the full architecture recipes before building from scratch.
    hda_def.setParmTemplateGroup(ptg)
    hda_def.save(hda_def.libraryFilePath())
    ```
-
-### HDA parameter type quick reference
-
-| Goal | Template class |
-|------|---------------|
-| Float slider | `hou.FloatParmTemplate(name, label, 1, default_value=(v,), min=lo, max=hi)` |
-| Integer slider | `hou.IntParmTemplate(name, label, 1, default_value=(v,), min=lo, max=hi)` |
-| XYZ vector | `hou.FloatParmTemplate(name, label, 3, default_value=(0,0,0), naming_scheme=hou.parmNamingScheme.XYZW)` |
-| Checkbox | `hou.ToggleParmTemplate(name, label, default_value=True)` |
-| Dropdown | `hou.MenuParmTemplate(name, label, menu_items=('a','b'), menu_labels=('A','B'), default_value=0)` |
-| File path | `hou.StringParmTemplate(name, label, 1, string_type=hou.stringParmType.FileReference)` |
-| Tab folder | `hou.FolderParmTemplate(name, label, folder_type=hou.folderType.Tabs)` |
-| Ramp | `hou.RampParmTemplate(name, label, ramp_parm_type=hou.rampParmType.Float)` |
-
-### Architecture HDA recipes (from knowledge base)
-
-**Ladder HDA** — key parameters: `rung_count` (Int), `rung_spacing` (Float),
-`rail_width` (Float), `rail_radius` (Float), `rung_radius` (Float).
-Build: two vertical `tube` rails + one `tube` rung template + `line` point source
-→ `copytopoints` → `merge`. All parms use `ch('../parm')` expressions.
-
-**Straight Staircase HDA** — key parameters: `step_count` (Int), `step_width`,
-`step_depth`, `step_height` (all Float). Build: single detail-class
-`attribwrangle` with a VEX for-loop that calls `addpoint()` + `addprim()` for
-each tread and riser. No Copy-to-Points needed.
-
-**Staircase with Railing HDA** — adds: `has_railing` (Toggle), `rail_height`,
-`rail_radius` (Float), `spindle_count` (Int), `spindle_radius` (Float).
-Build: staircase wrangle + `attribwrangle` rail-path points → `polywire` +
-spindle `tube` → `copytopoints`. `switch` SOP gates the railing on/off.
-Use two `FolderParmTemplate` Tabs (Staircase / Railing) to organise the interface.
 
 ### Expression wiring rule
 Inside the HDA's inner network, reference HDA parameters with `..`:

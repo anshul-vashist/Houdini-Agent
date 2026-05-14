@@ -10,24 +10,12 @@ RAG-driven knowledge base queries for VEX snippets, node recipes, and error fixe
 
 from . import _core as core
 
-_BUILD_QUERY_FALLBACKS = {
-    "cup": ["mug", "tea cup"],
-    "mug": ["cup", "tea cup"],
-    "chair": ["chair workflow", "dining chair", "kitchen chair"],
-    "table": ["table workflow", "dining table", "coffee table"],
-    "lamp": ["lamp workflow", "floor lamp", "desk lamp"],
-    "bottle": ["wine bottle"],
-    "bed": ["bed workflow", "mattress", "pillow"],
-    "sofa": ["sofa", "couch"],
-}
-
 
 def _expanded_search_queries(query: str, category_filter: str | None = None) -> list:
     query = str(query or "").strip()
     if not query:
         return []
 
-    lower = query.lower()
     variants = []
 
     def add(text: str):
@@ -45,12 +33,6 @@ def _expanded_search_queries(query: str, category_filter: str | None = None) -> 
     if category_filter:
         add(f"{query} {category_filter}")
 
-    for term, aliases in _BUILD_QUERY_FALLBACKS.items():
-        if term in lower:
-            for alias in aliases:
-                add(f"{alias} workflow")
-                add(f"{alias} node chain")
-                add(f"{alias} procedural high fidelity")
     return variants
 
 

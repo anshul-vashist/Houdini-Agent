@@ -20,6 +20,41 @@ from ._widgets import (
 
 class PanelLayoutMixin:
     @staticmethod
+    def _make_thumb_icon(up: bool, color: str) -> QtGui.QIcon:
+        pix = QtGui.QPixmap(22, 22)
+        pix.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(pix)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtGui.QPen(QtGui.QColor(color), 1.5))
+        painter.setBrush(QtGui.QColor(color))
+
+        if up:
+            painter.drawRoundedRect(QtCore.QRectF(8, 8, 8, 9), 2, 2)
+            painter.drawRoundedRect(QtCore.QRectF(4, 10, 4, 7), 1.5, 1.5)
+            thumb = QtGui.QPolygonF(
+                [
+                    QtCore.QPointF(8, 8),
+                    QtCore.QPointF(11, 4),
+                    QtCore.QPointF(13, 4),
+                    QtCore.QPointF(13, 8),
+                ]
+            )
+        else:
+            painter.drawRoundedRect(QtCore.QRectF(8, 5, 8, 9), 2, 2)
+            painter.drawRoundedRect(QtCore.QRectF(4, 5, 4, 7), 1.5, 1.5)
+            thumb = QtGui.QPolygonF(
+                [
+                    QtCore.QPointF(8, 14),
+                    QtCore.QPointF(11, 18),
+                    QtCore.QPointF(13, 18),
+                    QtCore.QPointF(13, 14),
+                ]
+            )
+        painter.drawPolygon(thumb)
+        painter.end()
+        return QtGui.QIcon(pix)
+
+    @staticmethod
     def _make_mic_icon(color: str = "#c8c8c8") -> QtGui.QIcon:
         pix = QtGui.QPixmap(22, 22)
         pix.fill(QtCore.Qt.transparent)
@@ -414,16 +449,20 @@ class PanelLayoutMixin:
         feedback_l = QtWidgets.QHBoxLayout(self.feedback_bar)
         feedback_l.setContentsMargins(0, 0, 0, 0)
         feedback_l.addStretch()
-        self.accept_btn = QtWidgets.QPushButton("+1")
+        self.accept_btn = QtWidgets.QPushButton("")
         self.accept_btn.setObjectName("accept_btn")
         self.accept_btn.setFixedSize(32, 28)
+        self.accept_btn.setIcon(self._make_thumb_icon(True, ModernStyles.ACCENT_SUCCESS))
+        self.accept_btn.setIconSize(QtCore.QSize(18, 18))
         self.accept_btn.setEnabled(False)
         self.accept_btn.setToolTip(
             "Thumbs up — save this successful turn so similar future requests can reuse it"
         )
-        self.reject_btn = QtWidgets.QPushButton("-1")
+        self.reject_btn = QtWidgets.QPushButton("")
         self.reject_btn.setObjectName("reject_btn")
         self.reject_btn.setFixedSize(32, 28)
+        self.reject_btn.setIcon(self._make_thumb_icon(False, ModernStyles.ACCENT_DANGER))
+        self.reject_btn.setIconSize(QtCore.QSize(18, 18))
         self.reject_btn.setEnabled(False)
         self.reject_btn.setToolTip(
             "Thumbs down — record this as an approach to avoid for similar future requests"
@@ -640,22 +679,26 @@ class PanelLayoutMixin:
         """Keep floating overlay panels anchored below the header."""
         if not hasattr(self, "settings_panel"):
             return
-        # Position settings overlay: full width minus margins, below header row (~46px)
-        m = 10  # matches root layout margins
-        header_h = 46  # approx header + spacing
-        w = self.width() - m * 2
+        # Position settings overlay against live widget geometry instead of a
+        # hard-coded header height. Houdini panels can be docked very small.
+        m = 10
+        anchor_y = 46
+        if hasattr(self, "workspace_splitter") and self.workspace_splitter.geometry().top() > 0:
+            anchor_y = max(36, self.workspace_splitter.geometry().top())
+        w = max(260, self.width() - m * 2)
         self.settings_panel.setFixedWidth(w)
         self.settings_panel.adjustSize()
         h = self.settings_panel.sizeHint().height()
-        self.settings_panel.setGeometry(m, header_h, w, h)
+        self.settings_panel.setGeometry(m, anchor_y, w, h)
         self.settings_panel.raise_()
 
         # Position scroll-to-bottom button: bottom-right of chat area
         if hasattr(self, "scroll_to_bottom_btn") and hasattr(self, "scroll"):
             sb_w = 28
             sb_h = 28
-            # Place it just above the composer input (~80px from bottom)
-            x = self.width() - sb_w - 20
-            y = self.height() - sb_h - 100
+            scroll_rect = self.scroll.geometry()
+            global_top_left = self.scroll.mapTo(self, QtCore.QPoint(0, 0))
+            x = global_top_left.x() + scroll_rect.width() - sb_w - 16
+            y = global_top_left.y() + scroll_rect.height() - sb_h - 16
             self.scroll_to_bottom_btn.setGeometry(x, y, sb_w, sb_h)
             self.scroll_to_bottom_btn.raise_()

@@ -77,6 +77,8 @@ class HoudiniMindPanel(
         self._autoresearch_loop = None
         self._autoresearch_running = False
         self._active_job_id = ""
+        self._active_job_subscription = ""
+        self._cancel_pending = False
         self.agent = None
         self.job_manager = None
         self.memory = None
@@ -89,8 +91,15 @@ class HoudiniMindPanel(
         self._live_stream_timer = QtCore.QTimer(self)
         self._live_stream_timer.setInterval(22)
         self._live_stream_timer.timeout.connect(self._drain_live_stream_queue)
+        self._panel_state_save_timer = QtCore.QTimer(self)
+        self._panel_state_save_timer.setSingleShot(True)
+        self._panel_state_save_timer.setInterval(400)
+        self._panel_state_save_timer.timeout.connect(self._persist_panel_state)
 
         self._backend_ready = False
+        self._backend_init_started = False
+        self._backend_init_ticks = 0
+        self._backend_init_thread = None
         self._asr_controller = None
         self._last_asr_note = ""
         self._last_asr_note_at = 0.0
@@ -127,14 +136,43 @@ class HoudiniMindPanel(
         except ImportError:
             pass
 
-        # Load RAG + MemoryManager + AgentLoop off the main thread
-        threading.Thread(
+        # Keep Houdini's Qt loop awake while backend init runs. In Houdini,
+        # heavy Python in a daemon thread can otherwise leave the panel looking
+        # frozen until the next input event (typing/clicking).
+        self._backend_init_heartbeat = QtCore.QTimer(self)
+        self._backend_init_heartbeat.setInterval(100)
+        self._backend_init_heartbeat.timeout.connect(self._tick_backend_init_heartbeat)
+        self._backend_init_heartbeat.start()
+
+        # Start backend boot after the panel constructor returns so Houdini gets
+        # a paint/input cycle before any CPU-heavy Python imports or DB reads.
+        QtCore.QTimer.singleShot(250, self._start_backend_init)
+
+    # ── Async backend init helpers ────────────────────────────────────
+
+    def _tick_backend_init_heartbeat(self) -> None:
+        self._backend_init_ticks += 1
+        if self._backend_ready:
+            timer = getattr(self, "_backend_init_heartbeat", None)
+            if timer is not None:
+                timer.stop()
+            return
+        lbl = getattr(self, "turn_status_lbl", None)
+        if lbl and self._backend_init_ticks % 10 == 0:
+            dots = "." * ((self._backend_init_ticks // 10) % 4)
+            lbl.setText(f"Initializing — loading agent{dots}")
+
+    def _start_backend_init(self) -> None:
+        if self._backend_init_started:
+            return
+        self._backend_init_started = True
+        thread = threading.Thread(
             target=self._init_backend_async,
             daemon=True,
             name="hm-backend-init",
-        ).start()
-
-    # ── Async backend init helpers ────────────────────────────────────
+        )
+        self._backend_init_thread = thread
+        thread.start()
 
     def _set_init_loading_state(self, loading: bool) -> None:
         """Show/hide the 'Initializing…' overlay in the turn strip."""
@@ -190,17 +228,35 @@ class HoudiniMindPanel(
     def _on_backend_ready(self, error_msg: str) -> None:
         """Called on the Qt main thread once the backend has loaded."""
         self._backend_ready = True
+        timer = getattr(self, "_backend_init_heartbeat", None)
+        if timer is not None:
+            timer.stop()
+        if hasattr(self, "settings_panel") and hasattr(self.settings_panel, "load_config"):
+            self.settings_panel.load_config(self.config)
+        self._restore_panel_state()
+        self._reposition_overlays()
         self._set_init_loading_state(False)
         if error_msg:
             lbl = getattr(self, "turn_status_lbl", None)
             if lbl:
                 lbl.setText(f"Init error: {error_msg[:60]}")
+            send = getattr(self, "send_btn", None)
+            mic = getattr(self, "mic_btn", None)
+            if send:
+                send.setEnabled(False)
+                send.setToolTip("Backend initialization failed")
+            if mic:
+                mic.setEnabled(False)
+                mic.setToolTip("Backend initialization failed")
+            self._add_status_notice(f"Startup failed:\n- Backend: {error_msg}", tone="danger")
         else:
             # Wire everything that depends on agent/memory being present
             self._setup_asr_ui()
             self._start_event_hooks()
+            self._show_startup_diagnostics()
             self._refresh_models_async()
             self._restore_conversation_ui()
+            self._restore_active_job_ui()
             # Refresh header meta (connection dot, model label)
             try:
                 self._refresh_header_meta()

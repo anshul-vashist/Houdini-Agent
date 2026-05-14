@@ -35,6 +35,29 @@ _TECHNICAL_TERMS = re.compile(
     re.IGNORECASE,
 )
 _COMPLEX_KEYWORDS = re.compile(r"\b(workflow|pipeline|setup|complete|full)\b", re.IGNORECASE)
+_DIRECT_NODE_EDIT_TERMS = re.compile(
+    r"\b("
+    r"sop|node|nodes|parm|parms|parameter|parameters|"
+    r"tube|box|sphere|grid|null|merge|transform|blast|"
+    r"polyextrude|poly\s+extrude|extrude|polybevel|poly\s+bevel|"
+    r"boolean|copytopoints|copy\s+to\s+points|scatter|attribwrangle|"
+    r"mountain|subdivide|bend|switch|color|normal|filecache|file\s+cache|"
+    r"columns|rows|primitive|primitives"
+    r")\b",
+    re.IGNORECASE,
+)
+_DIRECT_NODE_EDIT_ACTIONS = re.compile(
+    r"\b(create|add|make|set|attach|connect|wire|append|change|adjust)\b",
+    re.IGNORECASE,
+)
+_RAG_NEEDED_TERMS = re.compile(
+    r"\b("
+    r"why|how|explain|compare|best|workflow|pipeline|complete|full|"
+    r"high\s+fidelity|procedural\s+(?:asset|model)|simulation|solver|"
+    r"vex|wrangle|python|hom|hda|error|debug|fix|troubleshoot"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _BUILD_GOAL_FALLBACKS = {
     "cup": ["mug", "tea cup"],
@@ -169,6 +192,19 @@ class ContextInjector:
                     add_variant(f"{alias} procedural high fidelity")
         return variants
 
+    def _is_simple_direct_node_edit(self, query: str, request_mode: str | None) -> bool:
+        """True for explicit small node/parameter edits that RAG only slows down."""
+        if str(request_mode or "").lower() != "build":
+            return False
+        q = str(query or "").strip()
+        if not q:
+            return False
+        if len(q.split()) > 36:
+            return False
+        if _RAG_NEEDED_TERMS.search(q):
+            return False
+        return bool(_DIRECT_NODE_EDIT_ACTIONS.search(q) and _DIRECT_NODE_EDIT_TERMS.search(q))
+
     # ── Technical synonym map for query enrichment ───────────────────
     _TECH_SYNONYMS: dict = {
         # SOP node aliases
@@ -280,6 +316,20 @@ class ContextInjector:
         Returns None if no relevant context is found.
         Returns {"role": "system", "content": "..."} otherwise.
         """
+        if (
+            self._is_simple_direct_node_edit(query, request_mode)
+            and not live_scene_json
+            and not force_chunks
+            and not include_categories
+        ):
+            self.last_context_meta = {
+                "query": query,
+                "used_count": 0,
+                "gate": "simple_direct_node_edit",
+                "estimated_tokens": 0,
+            }
+            return None
+
         # P1-B: VEX bypass — pure "write VEX to do X" queries that the LLM handles
         # without RAG.  Restricts to vex_reference shard only (function signatures
         # are still useful); trivial remaps/sets skip retrieval entirely.
@@ -602,33 +652,20 @@ class ContextInjector:
         budget_chars = int(token_budget * self._chars_per_token)
         used_chars = 0
 
-        header = (
-            "═══════════════════════════════════════════════════\n"
-            "  HOUDINI KNOWLEDGE BASE — Retrieved for this query\n"
-            "═══════════════════════════════════════════════════\n"
-            "The following sections contain authoritative Houdini\n"
-            "documentation relevant to the user's question.\n"
-            "Use this knowledge to support accurate answers or build steps.\n"
-            "Do not replace required scene actions with a generic summary.\n"
-            "═══════════════════════════════════════════════════\n\n"
-        )
+        header = "# KB\n"
         used_chars += len(header)
 
         section_texts = []
         for _i, chunk in enumerate(chunks):
-            # Skip live scene if it would overflow
             is_scene = chunk.get("id") == "live_scene"
 
             title = chunk.get("title", "")
             category = chunk.get("category", "")
             content = chunk.get("content", "").strip()
-            chunk.get("_score", 0)
 
             if is_scene:
-                # Truncate scene JSON to save budget
                 max_scene_chars = int(budget_chars * 0.4)
                 if len(content) > max_scene_chars:
-                    # Find last complete JSON object boundary to avoid invalid JSON
                     truncated = content[:max_scene_chars]
                     last_brace = max(truncated.rfind("}"), truncated.rfind("]"))
                     if last_brace > max_scene_chars // 2:
@@ -637,12 +674,12 @@ class ContextInjector:
                         )
                     else:
                         content = truncated + "\n... [scene truncated for brevity]"
-                section = f"▶ LIVE SCENE STATE (current Houdini session):\n{content}\n"
+                section = f"## scene\n{content}\n"
             else:
-                section = f"▶ [{category.upper()}] {title}\n{'─' * 50}\n{content}\n"
+                cat_tag = category.lower() if category else "ref"
+                section = f"## {cat_tag}: {title}\n{content}\n"
 
             if used_chars + len(section) > budget_chars:
-                # Truncate this chunk to fit
                 remaining = budget_chars - used_chars - 100
                 if remaining > 200:
                     section = section[:remaining] + "\n... [truncated]\n"
@@ -652,13 +689,7 @@ class ContextInjector:
             section_texts.append(section)
             used_chars += len(section)
 
-        footer = (
-            "\n═══════════════════════════════════════════════════\n"
-            "  END OF KNOWLEDGE BASE CONTEXT\n"
-            "═══════════════════════════════════════════════════\n"
-        )
-
-        return header + "\n".join(section_texts) + footer
+        return header + "\n".join(section_texts)
 
     # ------------------------------------------------------------------
     # Context window estimation

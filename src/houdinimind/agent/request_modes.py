@@ -111,12 +111,13 @@ CACHE_TTL = {
 }
 
 BUILD_INTENT_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+|i\s+(?:want|need)\s+(?:you\s+to\s+)?|)"
     r"(create|build|make|model|add|place|move|set|change|adjust|connect|wire|"
     r"layout|arrange|organize|duplicate|rename|assign|apply|extrude|bevel|"
     r"fracture|shatter|break|destroy|simulate|solver|cache|bake|run|playblast|"
     r"render|scatter|copy|instance|merge|boolean|subdivide|remesh|deform|"
-    r"convert|package|wrap|promote|export|save|write|delete|remove|replace|swap)\b",
+    r"convert|package|wrap|promote|export|save|write|delete|remove|replace|swap|"
+    r"emit|emitter|source|spawn|generate)\b",
     re.IGNORECASE,
 )
 
@@ -156,6 +157,15 @@ _RAG_VEX_HINT_RE = re.compile(
     r"quaternion|noise|fit|snoise|curlnoise|vop)\b)",
     re.IGNORECASE,
 )
+VEX_CODE_INTENT_RE = re.compile(
+    r"(@[A-Za-z_]\w*|\b(vex|vfl|wrangle|attribwrangle|pointwrangle|"
+    r"primwrangle|detailwrangle|snippet|setpointattrib|setprimattrib|"
+    r"setdetailattrib|addpoint|addprim|removepoint|removeprim|chramp|"
+    r"pcopen|pciterate|pcimport|nearpoint|nearpoints|xyzdist|primuv|"
+    r"volumesample|volumegradient|curlnoise|anoise|snoise|fit01?|"
+    r"quaternion|qrotate|maketransform|dihedral|pscale|orient)\b)",
+    re.IGNORECASE,
+)
 _RAG_USD_HINT_RE = re.compile(
     r"\b(usd|solaris|lop|karma|materialx|stage|prim|scene graph)\b",
     re.IGNORECASE,
@@ -165,10 +175,21 @@ _RAG_GENERAL_HINT_RE = re.compile(
     r"functions|syntax|script|scripts)\b",
     re.IGNORECASE,
 )
+_RAG_PYTHON_HINT_RE = re.compile(
+    r"\b(python|hom|hou(?:\.[A-Za-z_]\w*)+|shelf\s+tool|python\s+panel|"
+    r"viewer\s+state|parmtemplate|parm\s+template|createnode|setparmtemplategroup)\b",
+    re.IGNORECASE,
+)
 BUILD_MODE_ALWAYS_DISABLED_TOOLS = {
     "get_error_fix",
     "search_docs",
     "get_vex_snippet",
+    "setup_flip_fluid",
+    "setup_pop_sim",
+    "setup_pyro_sim",
+    "setup_rbd_fracture",
+    "setup_vellum_cloth",
+    "setup_vellum_pillow",
 }
 BUILD_MODE_WORKFLOW_TOOLS = {
     "search_knowledge",
@@ -205,10 +226,12 @@ BUILD_QUERY_STOPWORDS = {
     "procedural",
     "procedurally",
     "proper",
+    "quick",
     "really",
     "set",
     "simple",
     "some",
+    "test",
     "the",
     "this",
     "to",
@@ -228,8 +251,11 @@ BUILD_QUERY_ACTION_WORDS = {
     "change",
     "connect",
     "duplicate",
+    "emit",
+    "emitter",
     "extrude",
     "fix",
+    "generate",
     "layout",
     "make",
     "model",
@@ -239,6 +265,9 @@ BUILD_QUERY_ACTION_WORDS = {
     "rotate",
     "scale",
     "set",
+    "simulate",
+    "source",
+    "spawn",
     "wire",
 }
 BUILD_QUERY_DESCRIPTOR_WORDS = {
@@ -390,209 +419,79 @@ def _query_needs_workflow_grounding(text: str) -> bool:
         "structure",
         "furniture",
     }
-    if tokens & explicit_workflow_terms:
-        return True
-    return bool(tokens & _MULTI_PART_BUILD_OBJECTS)
+    return bool(tokens & (explicit_workflow_terms | _SPATIAL_RELATIONSHIP_TERMS))
 
 
-_MULTI_PART_BUILD_OBJECTS = {
-    # Furniture — need seat/legs/backrest etc.
-    "chair",
-    "stool",
-    "table",
-    "desk",
-    "sofa",
-    "couch",
-    "bed",
-    "bench",
-    "shelf",
-    "bookcase",
-    "cabinet",
-    "dresser",
-    "wardrobe",
-    # Structures
-    "house",
-    "building",
-    "room",
-    "wall",
-    "door",
-    "window",
-    "roof",
-    "bridge",
-    "tower",
-    "fence",
-    "gate",
-    "arch",
-    # Vehicles
-    "car",
-    "truck",
-    "bus",
-    "boat",
-    "ship",
-    "plane",
-    "bicycle",
-    "motorcycle",
-    # Props
-    "lamp",
-    "bottle",
-    "cup",
-    "mug",
-    "vase",
-    "pot",
-    "crate",
-    "barrel",
-    "bucket",
-    "basket",
-    "bag",
-    # Characters / anatomy
-    "character",
-    "body",
-    "hand",
-    "arm",
-    "leg",
-    "head",
-    "face",
-    # Tech
-    "robot",
-    "machine",
-    "engine",
-    "pipe",
-    "column",
-    "pillar",
-    # Nature / organic
-    "tree",
-    "branch",
-    "flower",
-    "rock",
-    "stone",
+# Tasks that involve spatial relationships between objects need the same
+# spatial-layout audit that furniture builds get — origin-stuck generators
+# silently break "wherever X touches Y" semantics.
+_SPATIAL_RELATIONSHIP_TERMS = {
+    "ground",
+    "floor",
+    "contact",
+    "contacts",
+    "touching",
+    "touches",
+    "collision",
+    "collide",
+    "colliding",
+    "stand",
+    "standing",
+    "rest",
+    "resting",
+    "sit",
+    "sitting",
+    "feet",
+    "foot",
+    "land",
+    "landing",
 }
 
 
 def _query_is_complex(text: str) -> bool:
+    """Evaluate query complexity based purely on length and heavy workflow cues.
+    No hardcoded lists of physical objects (like 'table' or 'chair') are used here.
+    """
     words = re.findall(r"[a-z0-9_]+", text.lower())
     if not words:
         return False
+
     tokens = set(words)
+    # If it's a long request, it likely needs a plan.
+    if len(words) >= 15:
+        return True
 
-    advanced_terms = {
-        "vex",
-        "hscript",
-        "python",
-        "hom",
-        "usd",
-        "solaris",
-        "lop",
-        "dop",
-        "dopnet",
-        "simulation",
+    # If it explicitly mentions complex simulation or asset keywords, it needs a plan.
+    heavy_cues = {
         "sim",
-        "pdg",
-        "tops",
-        "karma",
-        "materialx",
-        "wrangle",
-        "attribwrangle",
-        "fracture",
-        "solver",
-        "rbd",
-        "bullet",
-        "physics",
-        "collision",
-        "collider",
-        "collide",
-        "impact",
-        "animate",
-        "animated",
-        "animation",
-        "keyframe",
-        "vellum",
-        "flip",
+        "simulation",
         "pyro",
-        "fluid",
-        "smoke",
-        "fire",
-        "cloth",
+        "flip",
+        "vellum",
+        "rbd",
+        "fracture",
+        "hda",
+        "digital",
+        "asset",
+        "solver",
+        "vop",
+        "vex",
     }
-    debug_terms = {
-        "broken",
-        "debug",
-        "diagnose",
-        "error",
-        "errors",
-        "failing",
-        "fix",
-        "issue",
-        "issues",
-        "missing",
-        "problem",
-        "problems",
-        "repair",
-        "stuck",
-        "why",
-    }
-
-    # Build requests that name a recognisable multi-part object always need
-    # planning even if the query is short (e.g. "create a chair" = 3 words).
-    multi_part_hits = tokens & _MULTI_PART_BUILD_OBJECTS
-    if multi_part_hits:
-        # Skip planning for bare "create a <single object>" requests (≤ 5 words).
-        # These are straightforward enough that the model builds them correctly
-        # without a plan — and the planning round-trip just wastes 45+ seconds.
-        if (
-            len(multi_part_hits) == 1
-            and len(words) <= 5
-            and not (tokens & advanced_terms)
-            and not (tokens & debug_terms)
-        ):
-            return False
-
-        simple_modeling_cues = {
-            "procedural",
-            "visible",
-            "out",
-            "output",
-            "node",
-            "nodes",
-            "sop",
-            "geo",
-            "network",
-            "obj",
-            "basic",
-            "simple",
-            "quick",
-        }
-        return not (
-            len(multi_part_hits) == 1
-            and len(words) <= 12
-            and tokens & simple_modeling_cues
-            and not tokens & advanced_terms
-            and not tokens & debug_terms
-        )
-
-    if len(words) <= 10 and not (tokens & advanced_terms) and not (tokens & debug_terms):
-        return False
-    if len(words) >= 18:
+    if tokens & heavy_cues:
         return True
-    if tokens & advanced_terms:
-        return True
-    technical_terms = tokens & (
-        BUILD_QUERY_TECHNICAL_WORDS - {"node", "nodes", "null", "obj", "output", "outputs"}
-    )
-    technical_count = len(technical_terms)
-    primitive_count = len(tokens & BUILD_QUERY_PRIMITIVE_WORDS)
-    descriptor_count = len(tokens & BUILD_QUERY_DESCRIPTOR_WORDS)
-    debug_count = len(tokens & debug_terms)
-    return (
-        debug_count >= 2
-        or technical_count >= 2
-        or (len(words) >= 12 and (technical_count + primitive_count + descriptor_count) >= 4)
-    )
+
+    return False
 
 
 def _build_mode_disabled_tools_for_query(query: str) -> set:
     disabled = set(BUILD_MODE_ALWAYS_DISABLED_TOOLS)
     if not _query_needs_workflow_grounding(query):
         disabled.update(BUILD_MODE_WORKFLOW_TOOLS)
+    if VEX_CODE_INTENT_RE.search(str(query or "")):
+        disabled.discard("search_knowledge")
+        disabled.discard("get_vex_snippet")
+    if _RAG_PYTHON_HINT_RE.search(str(query or "")):
+        disabled.discard("search_knowledge")
     return disabled
 
 
@@ -631,6 +530,8 @@ def get_rag_category_policy(request_mode: str, query: str = "") -> dict:
         extras.extend(["vex", "general"])
     if _RAG_USD_HINT_RE.search(text):
         extras.extend(["usd", "nodes"])
+    if _RAG_PYTHON_HINT_RE.search(text):
+        extras.extend(["python", "general"])
     if _RAG_GENERAL_HINT_RE.search(text):
         extras.append("general")
 
@@ -683,13 +584,25 @@ class AutoResearcher:
             sub_questions = self._decompose(query, all_context)
             _p(f"\u200b\U0001f4cb {len(sub_questions)} sub-question(s) identified")
 
-            for i, sq in enumerate(sub_questions):
-                _p(f"\u200b\U0001f4da Retrieving [{i + 1}/{len(sub_questions)}]: {sq[:60]}…")
-                chunk = self._retrieve(sq)
-                if chunk and "INSUFFICIENT_DATA" not in chunk:
-                    all_context.append(f"Q: {sq}\nA: {chunk}")
-                elif chunk:
-                    _p(f"\u200b\u26a0\ufe0f  Skipped thin context for: {sq[:40]}…")
+            # Execute retrieval concurrently
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_to_sq = {}
+                for i, sq in enumerate(sub_questions):
+                    _p(f"\u200b\U0001f4da Retrieving [{i + 1}/{len(sub_questions)}]: {sq[:60]}…")
+                    future_to_sq[executor.submit(self._retrieve, sq)] = sq
+
+                for future in concurrent.futures.as_completed(future_to_sq):
+                    sq = future_to_sq[future]
+                    try:
+                        chunk = future.result()
+                        if chunk and "INSUFFICIENT_DATA" not in chunk:
+                            all_context.append(f"Q: {sq}\nA: {chunk}")
+                        elif chunk:
+                            _p(f"\u200b\u26a0\ufe0f  Skipped thin context for: {sq[:40]}…")
+                    except Exception:
+                        _p(f"\u200b\u26a0\ufe0f  Retrieval failed for: {sq[:40]}…")
 
             _p(f"\u200b\u2699\ufe0f  Synthesising {len(all_context)} chunk(s) into 3 options…")
             options = self._synthesise_options(query, all_context)
@@ -713,7 +626,7 @@ class AutoResearcher:
         raw = self.llm.chat_simple(
             system=(
                 "You are a Houdini FX research planner.\n"
-                "Output EXACTLY 2 sub-questions that together fully cover the user question.\n"
+                "Output 1 or 2 sub-questions that together fully cover the user question.\n"
                 "Each sub-question must reference specific Houdini nodes, parms, or VEX functions.\n"
                 "Output ONLY a numbered list — no preamble, no explanations."
             ),
@@ -725,7 +638,12 @@ class AutoResearcher:
             clean = re.sub(r"^[\d]+[.)\s]+|^[-*]\s*", "", line.strip()).strip()
             if len(clean) > 10:
                 questions.append(clean)
-        return questions[:2] or [query]
+
+        # Always include the original query as well to maximize RAG hit chances
+        if not questions:
+            return [query]
+        # Keep original query + up to 2 LLM generated ones
+        return [query, *questions[:2]]
 
     def _retrieve(self, sub_q: str) -> str:
         if self.rag:

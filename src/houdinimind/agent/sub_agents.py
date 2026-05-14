@@ -7,8 +7,11 @@
 HoudiniMind — Sub-Agent Architecture v2
 
 Defines specialized sub-agents with constrained tool access:
-  - PlannerAgent:   Generates structured build plans (read-only tools)
-  - ValidatorAgent: Post-build quality checks (read + vision tools)
+  - OrchestratorAgent: Classifies/routes work between specialist phases
+  - PlannerAgent:      Generates structured build plans (read-only tools)
+  - DebuggerAgent:     Diagnoses failed/debug scene states
+  - ResearcherAgent:   Performs bounded RAG/documentation research
+  - ValidatorAgent:    Post-build quality checks (read + vision tools)
 
 Each sub-agent has its own system prompt and tool whitelist,
 preventing accidental scene mutation from the wrong phase. The base
@@ -247,6 +250,25 @@ class PlannerAgent(SubAgent):
         raw = self.run(user_goal, context=scene_context)
         return self._parse_plan(raw, user_goal)
 
+    def generate_repair_plan(
+        self,
+        user_goal: str,
+        verification_report: dict,
+        scene_context: str = "",
+        previous_plan: dict | None = None,
+    ) -> dict:
+        issues = verification_report.get("issues") or []
+        prompt = (
+            "The previous Houdini build failed verification. Generate a NEW targeted repair plan, "
+            "not a continuation of the failed approach.\n\n"
+            f"Original goal:\n{user_goal}\n\n"
+            f"Verification summary:\n{verification_report.get('summary', '')}\n\n"
+            f"Issues:\n{json.dumps(issues, default=str)[:4000]}\n\n"
+            f"Previous plan:\n{json.dumps(previous_plan or {}, default=str)[:3000]}"
+        )
+        raw = self.run(prompt, context=scene_context)
+        return self._parse_plan(raw, user_goal)
+
     @classmethod
     def _parse_plan(cls, raw: str, fallback_goal: str) -> dict:
         """Parse the hierarchical JSON plan from the LLM response."""
@@ -385,6 +407,140 @@ class PlannerAgent(SubAgent):
         for pattern, replacement in cls._TEXT_REPLACEMENTS:
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", text).strip()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  OrchestratorAgent — routes work between phases
+# ══════════════════════════════════════════════════════════════════════
+
+
+class OrchestratorAgent(SubAgent):
+    NAME = "orchestration"
+    MAX_TOOL_ROUNDS = 1
+    SYSTEM_PROMPT = (
+        "You are a Houdini agent orchestrator. Decide which specialist phase should handle "
+        "the request. Return only JSON: "
+        '{"route":"build|debug|research|advice","reason":"short reason","needs_plan":true|false}.'
+    )
+    ALLOWED_TOOLS = set()
+
+    def route(self, user_message: str, classified_mode: str, context: str = "") -> dict:
+        raw = self.run(
+            f"Classified mode: {classified_mode}\nUser request: {user_message}",
+            context=context,
+        )
+        match = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                route = str(data.get("route") or classified_mode).lower()
+                if route in {"build", "debug", "research", "advice"}:
+                    return {
+                        "route": route,
+                        "reason": str(data.get("reason") or ""),
+                        "needs_plan": bool(data.get("needs_plan", route in {"build", "debug"})),
+                    }
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {
+            "route": classified_mode if classified_mode in {"build", "debug"} else "advice",
+            "reason": "Fallback to classifier result.",
+            "needs_plan": classified_mode in {"build", "debug"},
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DebuggerAgent — diagnoses broken scene states
+# ══════════════════════════════════════════════════════════════════════
+
+
+class DebuggerAgent(SubAgent):
+    NAME = "debugger"
+    MAX_TOOL_ROUNDS = 5
+    SYSTEM_PROMPT = (
+        "You are a Houdini debugging specialist. Inspect live scene errors, wiring, geometry, "
+        "simulation state, and node parameters. Return concise JSON: "
+        '{"issues":["path + issue"],"root_cause":"...","repair_strategy":["step"]}.'
+    )
+    ALLOWED_TOOLS = {
+        "get_scene_summary",
+        "get_all_errors",
+        "deep_error_trace",
+        "get_node_inputs",
+        "get_node_parameters",
+        "get_geometry_attributes",
+        "get_node_cook_info",
+        "inspect_display_output",
+        "get_bounding_box",
+        "check_geometry_issues",
+        "get_dop_objects",
+        "get_sim_stats",
+        "get_simulation_diagnostic",
+        "get_flip_diagnostic",
+        "find_nodes",
+        "search_knowledge",
+    }
+
+    def diagnose(self, goal: str, scene_context: str = "") -> dict:
+        raw = self.run(f"Diagnose this Houdini task/state:\n{goal}", context=scene_context)
+        match = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                return {
+                    "issues": list(data.get("issues") or []),
+                    "root_cause": str(data.get("root_cause") or ""),
+                    "repair_strategy": list(data.get("repair_strategy") or []),
+                    "raw": raw,
+                }
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {
+            "issues": [str(raw or "")[:500]],
+            "root_cause": "",
+            "repair_strategy": [],
+            "raw": raw,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ResearcherAgent — bounded knowledge retrieval
+# ══════════════════════════════════════════════════════════════════════
+
+
+class ResearcherAgent(SubAgent):
+    NAME = "researcher"
+    MAX_TOOL_ROUNDS = 4
+    SYSTEM_PROMPT = (
+        "You are a Houdini research specialist. Use retrieval tools to ground exact operator, "
+        "parameter, API, and workflow facts. Return concise JSON: "
+        '{"findings":["fact"],"recommended_context":"short context to inject"}.'
+    )
+    ALLOWED_TOOLS = {
+        "search_knowledge",
+        "get_vex_snippet",
+        "get_node_recipe",
+        "explain_node_type",
+        "suggest_workflow",
+        "search_docs",
+        "resolve_build_hints",
+        "list_node_types",
+    }
+
+    def research(self, query: str, context: str = "") -> dict:
+        raw = self.run(query, context=context)
+        match = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                return {
+                    "findings": list(data.get("findings") or []),
+                    "recommended_context": str(data.get("recommended_context") or ""),
+                    "raw": raw,
+                }
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {"findings": [str(raw or "")[:1000]], "recommended_context": "", "raw": raw}
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -200,8 +200,6 @@ class PanelStateMixin:
             return
         backend = str(self.config.get("backend", "ollama") or "ollama").lower()
         backend_label = "NVIDIA NIM" if backend == "nvidia" else "Ollama"
-        backend = str(self.config.get("backend", "ollama") or "ollama").lower()
-        backend_label = "NVIDIA NIM" if backend == "nvidia" else "Ollama"
         if (
             hasattr(self, "conn_status")
             and getattr(self.conn_status.retry_btn, "isVisible", lambda: False)()

@@ -23,9 +23,6 @@ class ModelAdapter:
         backend = str(self.config.get("backend", "") or "").strip().lower()
         if backend in ("nvidia", "openai", "anthropic", "openrouter"):
             return "cloud"
-        backend = str(self.config.get("backend", "") or "").strip().lower()
-        if backend in ("nvidia", "openai", "anthropic", "openrouter"):
-            return "cloud"
         if (
             "cloud" in self.model_name
             or "kimi" in self.model_name

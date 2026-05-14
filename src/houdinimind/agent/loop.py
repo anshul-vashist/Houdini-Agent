@@ -23,7 +23,10 @@ Upgrades over v11:
           inaccessible absolute path (Windows path on Linux etc).
 """
 
+import base64
+import binascii
 import difflib
+import hashlib
 import json
 import re
 import threading
@@ -36,12 +39,28 @@ from functools import partial
 
 from ..debug import DebugLogger
 from ..memory.world_model import WorldModel
+from . import preconditions as _preconditions
+from . import request_modes as _request_modes
 from ._tokenizer import count_message_tokens, count_tokens
+from .agentic_controller import AgenticController, summarize_agentic_plan
+from .budget import TurnBudget
+from .clarification import Clarifier
+from .components import (
+    HistoryManager,
+    PlanningPhase,
+    RepairPhase,
+    SceneStateManager,
+    SimulationHealthPhase,
+    ToolExecutionPhase,
+    VerificationPhase,
+    VisionPhase,
+)
 from .critic import RepairCritic
 from .llm_client import OllamaClient
 from .proxy_reference import ReferenceProxyPlanner
 from .request_modes import (
     BUILD_INTENT_RE,
+    BUILD_QUERY_ACTION_WORDS,
     CACHE_TTL,
     DEBUG_INTENT_RE,
     FOLLOWUP_BUILD_RE,
@@ -52,10 +71,10 @@ from .request_modes import (
     READ_ONLY_TOOLS,
     SIMPLE_PRIMITIVE_SOP_TYPES,
     STRUCTURAL_SOP_TYPES,
+    VEX_CODE_INTENT_RE,
     AutoResearcher,
     _asset_goal_terms,
     _build_mode_disabled_tools_for_query,
-    _query_is_complex,
     _query_needs_workflow_grounding,
     _query_terms,
     get_rag_category_policy,
@@ -66,14 +85,22 @@ from .semantic_scoring import (
     format_scorecard,
     parse_view_score,
 )
-from .sub_agents import PlannerAgent, ValidatorAgent
+from .sub_agents import (
+    DebuggerAgent,
+    OrchestratorAgent,
+    PlannerAgent,
+    ResearcherAgent,
+    ValidatorAgent,
+)
 from .tool_models import ToolArgumentError, ToolValidator
+from .tool_retry import CircuitBreaker, RetryPolicy
 from .tools import (
     TOOL_FUNCTIONS,
     TOOL_SAFETY_TIERS,
     TOOL_SCHEMAS,
     apply_scope_filter,
 )
+from .workflow_state import WorkflowStateStore
 
 try:
     import hou
@@ -82,6 +109,53 @@ try:
 except ImportError:
     HOU_AVAILABLE = False
 
+_query_is_complex = _request_modes._query_is_complex
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Tool criticality tiers
+# ══════════════════════════════════════════════════════════════════════
+# OPTIONAL_CONTEXT_TOOLS gather "nice to have" scene context. They are NOT
+# required for any build/edit operation — the agent can complete its goal
+# without them. When these tools fail (especially with timeouts when the
+# Houdini main thread is blocked), we convert the error into a soft "skipped"
+# status so the loop continues toward the actual user goal instead of
+# spinning on optional inspection retries.
+OPTIONAL_CONTEXT_TOOLS = frozenset(
+    {
+        "get_scene_summary",
+        "get_bounding_box",
+        "get_node_inputs",
+        "get_node_cook_info",
+        "get_geometry_attributes",
+        "inspect_display_output",
+        "analyze_geometry",
+        "sample_geometry",
+        "profile_network",
+        "get_hip_info",
+        "get_memory_usage",
+        "get_dop_objects",
+        "get_sim_stats",
+        "get_flip_diagnostic",
+        "list_vdb_grids",
+        "analyze_vdb",
+        "list_takes",
+        "get_packed_geo_info",
+        "list_all_file_references",
+        "scan_missing_files",
+        "get_cook_dependency_order",
+        "get_parm_expression_audit",
+        "list_material_assignments",
+        "list_installed_hdas",
+        "get_node_recipe",
+        "suggest_workflow",
+        "explain_node_type",
+        "compare_nodes",
+        "take_node_snapshot",
+        "measure_cook_time",
+    }
+)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  AgentLoop
@@ -89,6 +163,48 @@ except ImportError:
 class AgentLoop:
     PROGRESS_SENTINEL = "\x00AGENT_PROGRESS\x00"
     LLM_TRACE_SENTINEL = "\x00LLM_TRACE\x00"
+
+    # Internal scratch namespaces created by HoudiniMind for VEX validation
+    # and ephemeral checks. These should never be reported as user-visible
+    # outputs nor included in verification scope.
+    _HOUDINIMIND_SCRATCH_PREFIXES = (
+        "/obj/__HOUDINIMIND_TEMP_GEO__",
+        "/obj/__HOUDINIMIND_VEX_CHECKER__",
+    )
+
+    @staticmethod
+    def _compute_image_hash(image_b64: str | bytes | None) -> str:
+        """Return a stable hash for viewport capture payloads."""
+        if image_b64 is None:
+            return ""
+        payload = (
+            image_b64.decode("utf-8", errors="ignore")
+            if isinstance(image_b64, bytes)
+            else str(image_b64)
+        )
+        payload = payload.strip()
+        if "," in payload and payload[:64].lower().startswith("data:"):
+            payload = payload.split(",", 1)[1]
+        payload = "".join(payload.split())
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError):
+            raw = payload.encode("utf-8", errors="ignore")
+        return hashlib.sha256(raw).hexdigest()
+
+    @classmethod
+    def _is_scratch_path(cls, path: str | None) -> bool:
+        if not path:
+            return False
+        return any(path.startswith(p) for p in cls._HOUDINIMIND_SCRATCH_PREFIXES) or (
+            "__HOUDINIMIND_" in path
+        )
+
+    @classmethod
+    def _filter_scratch_error_nodes(cls, nodes: list[dict] | None) -> list[dict]:
+        return [
+            node for node in (nodes or []) if not cls._is_scratch_path(str(node.get("path") or ""))
+        ]
 
     def __init__(
         self,
@@ -135,6 +251,8 @@ class AgentLoop:
         self.memory_manager = memory_manager
         self.on_tool_call = on_tool_call
         self.rag = rag_injector
+        self._rag_init_lock = threading.Lock()
+        self._rag_init_attempted = rag_injector is not None
         self.config = config
 
         try:
@@ -173,6 +291,29 @@ class AgentLoop:
         )
         self.auto_network_view_checks = bool(config.get("auto_network_view_checks", True))
         self.verify_skip_vision = bool(config.get("verify_skip_vision", False))
+        self.clarification_enabled = bool(config.get("clarification_enabled", True))
+        self._clarifier = Clarifier(self.llm, enabled=self.clarification_enabled)
+        self.preconditions_enabled = bool(config.get("preconditions_enabled", True))
+        # Active failure-driven blacklist: blocks repeating an identical
+        # (tool, args) signature that has already failed recently.
+        self.failure_blacklist_enabled = bool(config.get("failure_blacklist_enabled", True))
+        self.failure_blacklist_window = max(1, int(config.get("failure_blacklist_window", 12)))
+        self.tool_retry_enabled = bool(config.get("tool_retry_enabled", True))
+        self._retry_policy = RetryPolicy(
+            max_attempts=max(1, int(config.get("tool_retry_max_attempts", 3))),
+            base_delay_s=max(0.05, float(config.get("tool_retry_base_delay_s", 0.4))),
+            max_delay_s=max(0.5, float(config.get("tool_retry_max_delay_s", 4.0))),
+        )
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=max(2, int(config.get("circuit_breaker_threshold", 4))),
+            cool_down_s=max(5.0, float(config.get("circuit_breaker_cool_down_s", 60.0))),
+        )
+        self._turn_budget = TurnBudget(
+            wall_clock_s=max(10.0, float(config.get("turn_wall_clock_s", 240.0))),
+            max_input_tokens=max(2000, int(config.get("turn_max_input_tokens", 200_000))),
+            max_output_tokens=max(500, int(config.get("turn_max_output_tokens", 16_000))),
+            enabled=bool(config.get("turn_budget_enabled", True)),
+        )
         self.semantic_scoring_enabled = bool(config.get("semantic_scoring_enabled", True))
         self.semantic_score_threshold = float(config.get("semantic_score_threshold", 0.72))
         self.semantic_multiview_enabled = bool(config.get("semantic_multiview_enabled", False))
@@ -203,6 +344,13 @@ class AgentLoop:
             max_iterations=config.get("research_iterations", 2),
         )
         self.debug_logger = DebugLogger(config.get("data_dir", "data"))
+        try:
+            self.workflow_state = WorkflowStateStore(
+                _os.path.join(config.get("data_dir", "data"), "db", "workflow_state.db")
+            )
+        except Exception as e:
+            self.workflow_state = None
+            print(f"[HoudiniMind] Workflow state store unavailable: {e}")
         # Wire debug_logger into LLM client so it can log retries & routing
         if hasattr(self.llm, "debug_logger"):
             self.llm.debug_logger = self.debug_logger
@@ -273,6 +421,10 @@ class AgentLoop:
         self._backup_done_this_session = False
         self._runtime_status_callback: Callable | None = None
         self._reference_proxy_planner = ReferenceProxyPlanner()
+        self._plan_verification_count = 0
+        self._turn_validation_failed = False
+        self._turn_validation_issues: list[str] = []
+        self._exhaustion_continuation_attempted = False
 
         # Phase 1: HACS Observation and World Model layer
         self.scene_observer = SceneObserver(
@@ -281,10 +433,13 @@ class AgentLoop:
         self._cache_scene_observation = bool(config.get("cache_scene_observation", True))
         if not hasattr(self, "world_model"):
             self.world_model = WorldModel()
+        # HARDENING: guard world_model against concurrent access from
+        # background snapshot thread and main chat() thread.
+        self._world_model_lock = threading.Lock()
 
         # ── v11 Intelligence Modules ──────────────────────────────────
         # Repair Critic: auto-diagnose tool errors and suggest fixes
-        self._critic_enabled = bool(config.get("enable_repair_critic", False))
+        self._critic_enabled = bool(config.get("enable_repair_critic", True))
         self._critic = (
             RepairCritic(
                 llm_chat_fn=self.llm.chat_simple,
@@ -306,6 +461,11 @@ class AgentLoop:
 
         # Structured Planning: PlannerAgent decomposes build/debug requests.
         self._plan_enabled = bool(config.get("plan_enabled", True))
+        self._agentic_enabled = bool(config.get("agentic_enabled", True))
+        self._agentic_enforce_plan_completion = bool(
+            config.get("agentic_enforce_plan_completion", False)
+        )
+        self._agentic_controller = AgenticController(READ_ONLY_TOOLS)
 
         # Sub-agents call this to actually hit the live scene. Without it
         # their declared tools would be silently ignored by run().
@@ -328,6 +488,32 @@ class AgentLoop:
             all_tool_schemas=TOOL_SCHEMAS,
             tool_executor=_sub_agent_tool_executor,
         )
+        self._orchestrator = OrchestratorAgent(
+            llm_chat_fn=self.llm.chat,
+            all_tool_schemas=TOOL_SCHEMAS,
+            tool_executor=None,
+        )
+        self._debugger = DebuggerAgent(
+            llm_chat_fn=self.llm.chat,
+            all_tool_schemas=TOOL_SCHEMAS,
+            tool_executor=_sub_agent_tool_executor,
+        )
+        self._researcher = ResearcherAgent(
+            llm_chat_fn=self.llm.chat,
+            all_tool_schemas=TOOL_SCHEMAS,
+            tool_executor=_sub_agent_tool_executor,
+        )
+        self.planning_phase = PlanningPhase(self._planner)
+        self.verification_phase = VerificationPhase(self._run_verification_suite)
+        self.tool_execution_phase = ToolExecutionPhase(self._execute_tool)
+        self.vision_phase = VisionPhase(self._capture_debug_screenshot)
+        self.repair_phase = RepairPhase(self._build_verification_repair_message)
+        self.history_manager = HistoryManager(self._compress_history_if_needed)
+        self.scene_state = SceneStateManager(
+            self._capture_scene_snapshot,
+            self._update_world_model_from_snapshot,
+        )
+        self.simulation_health_phase = SimulationHealthPhase(self._simulation_health_check_issues)
 
         if config.get("embed_tools_at_startup", True):
             self._warmup_tool_embeddings()
@@ -360,6 +546,34 @@ class AgentLoop:
             self._register_scene_event_listener()
 
         self._load_cross_turn_failures()
+
+    def _ensure_rag_loaded(self) -> bool:
+        if self.rag:
+            return True
+        if self._rag_init_attempted and not self.config.get("retry_deferred_rag", False):
+            return False
+        if self.config.get("rag_enabled", True) is False:
+            return False
+        with self._rag_init_lock:
+            if self.rag:
+                return True
+            if self._rag_init_attempted and not self.config.get("retry_deferred_rag", False):
+                return False
+            self._rag_init_attempted = True
+            try:
+                from houdinimind.rag import create_rag_pipeline
+
+                injector = create_rag_pipeline(self.config.get("data_dir", ""), self.config)
+                if hasattr(injector, "debug_logger"):
+                    injector.debug_logger = self.debug_logger
+                self.rag = injector
+                if hasattr(self, "auto_researcher"):
+                    self.auto_researcher.rag = injector
+                self.debug_logger.log_system_note("Deferred RAG pipeline loaded.")
+                return True
+            except Exception as exc:
+                self.debug_logger.log_system_note(f"Deferred RAG load failed: {exc}")
+                return False
 
     def _debug_model_meta(self) -> dict:
         return {
@@ -415,8 +629,6 @@ class AgentLoop:
         geometry correctness. Returns a correction message or None if OK.
         """
         if not self._vision_enabled or not self.llm.vision_enabled:
-            return None
-        if self._turn_capture_pane_analyses >= self.max_capture_pane_per_turn:
             return None
 
         try:
@@ -693,6 +905,48 @@ class AgentLoop:
                 break
         return False
 
+    def _last_assistant_was_question(self) -> bool:
+        """Return True if the previous assistant message was asking the user a
+        clarification question (i.e. ended with '?' or contained question
+        markers like 'which', 'what method', 'do you want', etc.).
+
+        Used by the task-anchor logic to detect when the user's next message is
+        a clarification *answer* rather than a fresh independent request.
+        """
+        for msg in reversed(self.conversation):
+            role = msg.get("role", "")
+            if role == "assistant":
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    continue
+                # Check the last 3 sentences for a question mark
+                last_sentences = content[-300:]
+                if "?" in last_sentences:
+                    return True
+                # Also check common clarification phrase patterns
+                content_lower = content.lower()
+                question_markers = (
+                    "which method",
+                    "which approach",
+                    "which type",
+                    "which fracture",
+                    "what method",
+                    "what type",
+                    "what approach",
+                    "do you want",
+                    "do you prefer",
+                    "would you like",
+                    "please clarify",
+                    "please specify",
+                    "can you clarify",
+                    "which one",
+                    "which option",
+                )
+                return any(m in content_lower for m in question_markers)
+            if role == "user":
+                break
+        return False
+
     def _classify_request_mode(self, user_message: str) -> tuple[str, float]:
         text = (user_message or "").strip()
         if not text:
@@ -702,6 +956,11 @@ class AgentLoop:
             return "build", 0.92
         if HDA_INTENT_RE.search(text):
             return "build", 0.95
+        if (
+            _query_needs_workflow_grounding(text)
+            and set(_query_terms(text)) & BUILD_QUERY_ACTION_WORDS
+        ):
+            return "build", 0.90
         if DEBUG_INTENT_RE.search(text):
             return "debug", 0.88
         if self.conversation and FOLLOWUP_BUILD_RE.search(text):
@@ -741,7 +1000,9 @@ class AgentLoop:
         return False
 
     def _prefetch_rag(self, query: str, mode: str) -> None:
-        if not self.config.get("prefetch_rag", False) or not self.rag:
+        if not self.config.get("prefetch_rag", False):
+            return
+        if not self.rag and not self._ensure_rag_loaded():
             return
 
         # ARCH-11: Use an Event so the consumer can distinguish "finished in
@@ -926,6 +1187,34 @@ class AgentLoop:
             )
         return None
 
+    def _query_mentions_known_vex_symbol(self, query: str) -> bool:
+        retriever = getattr(getattr(self, "rag", None), "retriever", None)
+        checker = getattr(retriever, "_query_mentions_vex_symbol", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(query))
+        except Exception:
+            return False
+
+    def _query_needs_vex_contract(self, query: str) -> bool:
+        text = str(query or "")
+        return bool(VEX_CODE_INTENT_RE.search(text) or self._query_mentions_known_vex_symbol(text))
+
+    def _build_vex_contract_guidance(self, query: str, request_mode: str) -> str | None:
+        if not self._query_needs_vex_contract(query):
+            return None
+        return (
+            "[VEX WRANGLE CONTRACT]\n"
+            "This turn may generate or edit VEX. Treat all VEX as an Attribute Wrangle snippet, not a standalone CVEX file or Python script.\n"
+            'Before writing VEX, retrieve dedicated VEX context: call search_knowledge(query=<user goal or function names>, top_k=5, category_filter="vex"). Use returned signatures and examples as authority.\n'
+            "When editing a live node, write code with write_vex_code(node_path, vex_code). That tool validates compile/cook behavior before setting the snippet; do not bypass it with safe_set_parameter unless write_vex_code is unavailable.\n"
+            "Preflight the snippet before finalizing: verify real VEX function names/signatures, wrangle attribute class assumptions, @attribute read/write usage, vector/float/int conversions, array syntax, geometry handles, and channel references.\n"
+            "Cook-reasoning checklist: use npoints(0) rather than assigning @numpt; use setpointattrib/setprimattrib/setdetailattrib for explicit writes; use geohandle 0 for current geometry; avoid Python/HOM calls; avoid undefined helper functions; guard point/prim lookups that can return -1.\n"
+            "If write_vex_code returns validation_failed or node cook errors, read the exact error, fix the code once or twice in-place, and retry before the final response. Do not return code that still has known syntax, type, attribute, or invalid-function errors.\n"
+            "Final response should state the node updated and validation status. If validation cannot run because Houdini/vcc is unavailable, explicitly say validation was unavailable and include the static preflight assumptions."
+        )
+
     def _build_dry_run_guidance(self) -> str:
         return (
             "[EXECUTION MODE: DRY RUN]\n"
@@ -998,7 +1287,7 @@ class AgentLoop:
             "Use these references only as structural guidance. Do not add extra props, demo geometry, simulations, collisions, or embellishments the user did not request."
         )
         lines.append(
-            "Do not stop at a single primitive if the request is for a multi-part object such as a table, chair, or bed."
+            "Do not stop at a single primitive when the request implies a multi-part object, assembly, or procedural setup."
         )
         return "\n".join(lines)
 
@@ -1006,6 +1295,8 @@ class AgentLoop:
         # Clear any stale cancel from a previous stopped turn so the new turn
         # doesn't immediately exit at its first cancel checkpoint.
         self._cancel_event.clear()
+        if getattr(self, "_turn_budget", None) is not None:
+            self._turn_budget.start()
         self._current_turn_checkpoint_path = None
         self._last_turn_verification_report = None
         self._last_turn_verification_text = None
@@ -1025,6 +1316,8 @@ class AgentLoop:
         self._plan_verification_count = 0
         self._turn_validation_failed = False
         self._turn_validation_issues: list[str] = []
+        self._exhaustion_continuation_attempted = False  # HARDENING: reset per turn
+        self._current_workflow_run_id = None
         # If the user attached an image this turn, chat_with_vision already ran one
         # vision call. Pre-charge the budget so _perform_visual_self_check respects
         # the per-turn cap and doesn't fire a redundant second analysis.
@@ -1045,14 +1338,35 @@ class AgentLoop:
 
     def _get_rag_injection_kwargs(self, request_mode: str, query: str = "") -> dict:
         policy = get_rag_category_policy(request_mode, query)
+        include_categories = policy.get("include_categories")
+        if self._query_needs_vex_contract(query):
+            include_categories = list(include_categories or [])
+            include_categories.extend(["vex", "nodes", "general"])
+            include_categories = list(dict.fromkeys(include_categories))
         kwargs = {
-            "include_categories": policy.get("include_categories"),
+            "include_categories": include_categories,
             "exclude_categories": policy.get("exclude_categories", []),
         }
         kwargs["include_memory"] = request_mode != "build"
         return kwargs
 
     # ── FIX-1: Dynamic tool selection ─────────────────────────────────
+    @staticmethod
+    def _is_simple_direct_sop_edit_query(query: str) -> bool:
+        terms = set(_query_terms(query))
+        if not terms:
+            return False
+        if not terms & SIMPLE_PRIMITIVE_SOP_TYPES:
+            return False
+        if terms & {"connect", "wire", "merge", "finalize", "finalise", "output", "out"}:
+            return False
+        return not _query_needs_workflow_grounding(query)
+
+    @staticmethod
+    def _requested_simple_sop_types(query: str) -> set[str]:
+        terms = set(_query_terms(query))
+        return terms & SIMPLE_PRIMITIVE_SOP_TYPES
+
     def _get_tool_schemas_for_request(self, query: str, request_mode: str) -> list:
         """
         Return only the top-N most relevant tool schemas for this specific query.
@@ -1085,6 +1399,18 @@ class AgentLoop:
 
         if request_mode == "build":
             disabled_tools = _build_mode_disabled_tools_for_query(query)
+            if getattr(self, "_fast_message_mode", False) and self._is_simple_direct_sop_edit_query(
+                query
+            ):
+                disabled_tools = set(disabled_tools)
+                disabled_tools.update(
+                    {
+                        "connect_nodes",
+                        "finalize_sop_network",
+                        "inspect_display_output",
+                        "set_display_flag",
+                    }
+                )
             selected = [
                 s for s in selected if s.get("function", {}).get("name", "") not in disabled_tools
             ]
@@ -1116,6 +1442,19 @@ class AgentLoop:
         self._turn_scene_write_epoch += 1
         self._turn_snapshot_cache = {}
         self._turn_capture_cache = {}
+        if bool(self.config.get("update_world_model_after_writes", True)):
+            try:
+                self.scene_state.refresh_after_write()
+            except Exception as e:
+                self.debug_logger.log_system_note(
+                    f"World model refresh after {tool_name or 'write'} skipped: {e}"
+                )
+
+    def _update_world_model_from_snapshot(self, snapshot: dict | None) -> None:
+        if not snapshot or not getattr(self, "world_model", None):
+            return
+        with self._world_model_lock:
+            self.world_model.update_from_scene_snapshot(snapshot)
 
     def _capture_scene_snapshot(self) -> dict | None:
         if not HOU_AVAILABLE:
@@ -1146,16 +1485,20 @@ class AgentLoop:
                 },
             )
 
+            def _build_snapshot(**_ignored):
+                return SceneReader(
+                    max_nodes=max_nodes,
+                    max_parms_per_node=max_parms,
+                    include_cook_hotspots=False,
+                    include_dop_summary=False,
+                    include_usd_summary=False,
+                    include_material_assignments=False,
+                ).snapshot("/")
+
             def _read_snapshot():
                 return self._hou_call(
-                    lambda: SceneReader(
-                        max_nodes=max_nodes,
-                        max_parms_per_node=max_parms,
-                        include_cook_hotspots=False,
-                        include_dop_summary=False,
-                        include_usd_summary=False,
-                        include_material_assignments=False,
-                    ).snapshot("/")
+                    _build_snapshot,
+                    _timeout_s=timeout_s,
                 )
 
             if self._has_houdini_main_thread_dispatch():
@@ -1295,6 +1638,8 @@ class AgentLoop:
             parent = self._parent_path(path)
             if not parent or parent.count("/") < 2:
                 return
+            if self._is_scratch_path(parent) or self._is_scratch_path(path):
+                return
             if parent not in candidates:
                 candidates.append(parent)
 
@@ -1323,156 +1668,6 @@ class AgentLoop:
             return path.startswith("/")
         return path == parent or path.startswith(parent + "/")
 
-    @staticmethod
-    def _bbox_axis_overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> float:
-        return max(0.0, min(float(a_max), float(b_max)) - max(float(a_min), float(b_min)))
-
-    @classmethod
-    def _detect_table_leg_support_issues(
-        cls, bbox_map: dict, tabletop_path: str, leg_paths: list[str]
-    ) -> list[dict]:
-        tabletop_bbox = bbox_map.get(tabletop_path) or {}
-        table_min = tabletop_bbox.get("min") or []
-        table_max = tabletop_bbox.get("max") or []
-        if len(table_min) < 3 or len(table_max) < 3:
-            return []
-
-        tabletop_bottom = float(table_min[1])
-        tabletop_thickness = max(0.0, float(table_max[1]) - float(table_min[1]))
-        gap_threshold = max(0.05, tabletop_thickness * 0.5)
-        issues = []
-
-        for leg_path in leg_paths:
-            leg_bbox = bbox_map.get(leg_path) or {}
-            leg_min = leg_bbox.get("min") or []
-            leg_max = leg_bbox.get("max") or []
-            if len(leg_min) < 3 or len(leg_max) < 3:
-                continue
-
-            leg_top = float(leg_max[1])
-            gap = tabletop_bottom - leg_top
-            if gap <= gap_threshold:
-                continue
-
-            overlap_x = cls._bbox_axis_overlap(table_min[0], table_max[0], leg_min[0], leg_max[0])
-            overlap_z = cls._bbox_axis_overlap(table_min[2], table_max[2], leg_min[2], leg_max[2])
-            if overlap_x <= 0.0 or overlap_z <= 0.0:
-                continue
-
-            issues.append(
-                {
-                    "severity": "repair",
-                    "path": leg_path,
-                    "message": (
-                        f"{leg_path} does not support the tabletop. "
-                        f"Its top is {gap:.3f} units below the tabletop underside."
-                    ),
-                }
-            )
-
-        return issues
-
-    def _table_support_verification_issues(
-        self,
-        user_message: str,
-        after_snapshot: dict | None,
-        parent_paths: list[str],
-        stream_callback: Callable | None = None,
-    ) -> list[dict]:
-        if "table" not in set(_query_terms(user_message)):
-            return []
-        if not after_snapshot or not parent_paths or "get_bounding_box" not in TOOL_FUNCTIONS:
-            return []
-
-        issues = []
-        after_nodes = after_snapshot.get("nodes", []) or []
-        bbox_map = {}
-
-        for parent_path in parent_paths[:2]:
-            sop_nodes = [
-                node
-                for node in after_nodes
-                if self._parent_path(node.get("path")) == parent_path
-                and str(node.get("category", "")).lower() == "sop"
-            ]
-            if not sop_nodes:
-                continue
-
-            leg_paths = [
-                str(node.get("path"))
-                for node in sop_nodes
-                if node.get("path") and "leg" in str(node.get("path")).lower().split("/")[-1]
-            ]
-            if not leg_paths:
-                # No leg-named nodes — check structural completeness.
-                # A table needs at minimum a tabletop + support (legs/base).
-                # Count generator SOPs (box, sphere, tube, etc.) to see if
-                # the build has enough distinct geometry nodes.
-                generator_types = {
-                    "box",
-                    "sphere",
-                    "tube",
-                    "torus",
-                    "grid",
-                    "circle",
-                    "platonic",
-                    "metaball",
-                }
-                generator_sops = [
-                    node
-                    for node in sop_nodes
-                    if str(node.get("type", "")).lower() in generator_types
-                ]
-                if len(generator_sops) < 3:
-                    issues.append(
-                        {
-                            "severity": "repair",
-                            "path": parent_path,
-                            "message": (
-                                f"Incomplete table structure: only {len(generator_sops)} "
-                                f"generator SOP(s) found (need at least 3: 1 tabletop + "
-                                f"2+ legs/supports). Create the missing leg nodes as "
-                                f"separate box SOPs inside {parent_path}."
-                            ),
-                        }
-                    )
-                continue
-
-            surface_candidates = [
-                str(node.get("path"))
-                for node in sop_nodes
-                if node.get("path")
-                and "leg" not in str(node.get("path")).lower().split("/")[-1]
-                and str(node.get("type", "")).lower() not in {"merge", "null", "output"}
-            ]
-            if not surface_candidates:
-                continue
-
-            for node_path in surface_candidates + leg_paths:
-                if node_path in bbox_map:
-                    continue
-                bbox_result = self._run_observation_tool(
-                    "get_bounding_box", {"node_path": node_path}, stream_callback
-                )
-                if bbox_result.get("status") == "ok":
-                    bbox_map[node_path] = bbox_result.get("data") or {}
-
-            def _footprint(path: str) -> float:
-                bbox = bbox_map.get(path) or {}
-                mins = bbox.get("min") or []
-                maxs = bbox.get("max") or []
-                if len(mins) < 3 or len(maxs) < 3:
-                    return -1.0
-                return abs(float(maxs[0]) - float(mins[0])) * abs(float(maxs[2]) - float(mins[2]))
-
-            tabletop_path = max(surface_candidates, key=_footprint, default=None)
-            if not tabletop_path or _footprint(tabletop_path) <= 0.0:
-                continue
-
-            issues.extend(self._detect_table_leg_support_issues(bbox_map, tabletop_path, leg_paths))
-
-        return issues
-
     def _extract_display_output_paths(
         self, snapshot: dict | None, parent_paths: list[str] | None = None
     ) -> list[str]:
@@ -1483,6 +1678,8 @@ class AgentLoop:
         for node in snapshot.get("nodes", []) or []:
             path = node.get("path")
             if not path:
+                continue
+            if self._is_scratch_path(path):
                 continue
             if parents and not any(self._path_under_parent(path, parent) for parent in parents):
                 continue
@@ -1623,6 +1820,14 @@ class AgentLoop:
             if backup_path:
                 self._current_turn_checkpoint_path = backup_path
                 self._last_turn_checkpoint_path = backup_path
+                run_id = getattr(self, "_current_workflow_run_id", None)
+                if run_id and getattr(self, "workflow_state", None):
+                    try:
+                        self.workflow_state.update_checkpoint(run_id, backup_path)
+                    except Exception as e:
+                        self.debug_logger.log_system_note(
+                            f"Workflow checkpoint update skipped: {e}"
+                        )
                 self._emit_runtime_status("checkpoint", path=backup_path)
                 if stream_callback:
                     stream_callback("\u200b💾 Turn checkpoint saved before scene edits…\n\n")
@@ -1788,11 +1993,10 @@ class AgentLoop:
                 "- Verification reported a problem, but no specific issue text was available."
             )
 
-        # FIX: Add spatial orientation rules to the repair guidance
         spatial_grounding = (
             "\n\nSPATIAL REPAIR RULES:\n"
-            "1. Gravity check: components like tabletops or lids must sit ABOVE their supports (Legs, Base).\n"
-            "2. Y-Axis Math: Top_Y = Support_Height + (Top_Thickness / 2). If legs are 0.75m high, the tabletop's center must be > 0.75m.\n"
+            "1. Gravity check: supported components must sit above their supports.\n"
+            "2. Y-axis math: center heights must account for each component's thickness and support height.\n"
             "3. Ground plane: Base elements must sit at Y >= 0."
         )
 
@@ -1800,6 +2004,13 @@ class AgentLoop:
         network_review = verification_report.get("network_review") or {}
         if network_review.get("summary"):
             network_summary = f"\n\nNetwork-view review summary:\n{network_review.get('summary')}"
+        repair_context = verification_report.get("repair_context") or ""
+        repair_context_section = ""
+        if repair_context:
+            repair_context_section = (
+                "\n\nEXISTING NODES TO REPAIR (do not duplicate or replace this chain):\n"
+                + str(repair_context).strip()
+            )
         return (
             "The current Houdini result is close, but verification found concrete issues.\n"
             f"Original request: {original_request}\n\n"
@@ -1807,20 +2018,110 @@ class AgentLoop:
             + "\n".join(issue_lines)
             + spatial_grounding
             + network_summary
+            + repair_context_section
             + "\n\nRules:\n"
             "1. Do not restart the build from scratch.\n"
             "2. Prefer the smallest targeted fix for each issue.\n"
-            "3. Reuse the existing nodes and wiring whenever possible.\n"
+            "3. Reuse the existing nodes and wiring. Do NOT create a second complete chain side-by-side.\n"
             "4. End on a visible OUT/null/output node if this is a SOP build.\n"
-            "5. After repairing, summarize exactly what you fixed.\n\n"
-            "MANDATORY: You MUST call at least one write tool (set_node_parameter, "
-            "connect_nodes, create_node, execute_python, etc.) to apply the fix. "
+            "5. Do NOT call create_node_chain to rebuild a chain that already exists in the repair context.\n"
+            "6. Only create a new node when the issue explicitly names a missing node that cannot be fixed by parameters or wiring.\n"
+            "7. After repairing, summarize exactly what you fixed.\n\n"
+            "MANDATORY: You MUST call at least one write tool (safe_set_parameter, "
+            "connect_nodes, finalize_sop_network, execute_python, etc.) to apply the fix. "
             "Reading parameters alone does NOT repair anything. If you have already "
             "identified the root cause in a previous inspection pass, skip re-reading "
-            "and go straight to fixing with set_node_parameter or the appropriate "
+            "and go straight to fixing with safe_set_parameter, connect_nodes, or the appropriate "
             "write tool. A repair pass that ends without any write tool call is a "
             "failure — the scene will be identical and verification will fail again."
         )
+
+    def _build_replan_repair_message(
+        self,
+        original_request: str,
+        verification_report: dict,
+        scene_context: str = "",
+        previous_plan: dict | None = None,
+    ) -> tuple[str, dict | None]:
+        replan = None
+        try:
+            replan = self.planning_phase.build_replan(
+                original_request,
+                verification_report,
+                scene_context=scene_context,
+                previous_plan=previous_plan,
+            )
+        except Exception as e:
+            self.debug_logger.log_phase(
+                "replan",
+                status="error",
+                meta={"error": str(e)[:200]},
+            )
+        if replan:
+            self.debug_logger.log_phase(
+                "replan",
+                status="ok",
+                meta={"mission": str(replan.get("mission", ""))[:200]},
+            )
+        return self.repair_phase.build_message(
+            original_request,
+            verification_report,
+            replan=replan,
+        ), replan
+
+    def _format_existing_nodes_for_repair(
+        self,
+        snapshot: dict | None,
+        parent_paths: list[str] | None,
+        outputs: list[str] | None = None,
+    ) -> str:
+        if not snapshot:
+            return ""
+        parents = [p for p in (parent_paths or []) if p]
+        output_set = set(outputs or [])
+        lines = []
+        for node in snapshot.get("nodes", []) or []:
+            path = node.get("path")
+            if not path:
+                continue
+            if parents and not any(self._path_under_parent(path, parent) for parent in parents):
+                continue
+            category = str(node.get("category") or "").lower()
+            if category and category != "sop":
+                continue
+            node_type = node.get("type") or "unknown"
+            inputs = [
+                inp.get("from_node")
+                for inp in (node.get("inputs") or [])[:3]
+                if inp.get("from_node")
+            ]
+            outputs_to = [
+                out.get("to_node") for out in (node.get("outputs") or [])[:3] if out.get("to_node")
+            ]
+            flags = []
+            if path in output_set or node.get("is_displayed"):
+                flags.append("display")
+            if node.get("is_render_flag"):
+                flags.append("render")
+            relation = []
+            if inputs:
+                relation.append("in: " + ", ".join(inputs))
+            if outputs_to:
+                relation.append("out: " + ", ".join(outputs_to))
+            suffix_parts = []
+            if flags:
+                suffix_parts.append("/".join(flags))
+            if relation:
+                suffix_parts.append("; ".join(relation))
+            suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
+            lines.append(f"- {path} [{node_type}]{suffix}")
+            if len(lines) >= 16:
+                lines.append("- ...")
+                break
+        if not lines:
+            return ""
+        parent_text = ", ".join(parents[:4]) if parents else "current build network"
+        return f"Focus network(s): {parent_text}\n" + "\n".join(lines)
 
     @staticmethod
     def _format_verification_report(report: dict | None) -> str:
@@ -2041,7 +2342,7 @@ class AgentLoop:
         after_snapshot: dict | None,
         parent_paths: list[str],
     ) -> list[dict]:
-        if not after_snapshot or not _query_needs_workflow_grounding(user_message):
+        if not after_snapshot:
             return []
 
         goal_terms = _asset_goal_terms(user_message)
@@ -2100,10 +2401,9 @@ class AgentLoop:
                     continue
 
             # ── Check 2: Display output is a mismatched primitive ─────
-            # Even if the network has many nodes (e.g. a partial table
-            # build), the display flag may be set on a wrong node (e.g.
-            # a sphere from a previous task).  Detect this by checking
-            # what the display output actually resolves to.
+            # Even if the network has many nodes, the display flag may be set
+            # on a stale or mismatched primitive. Detect this by checking what
+            # the display output actually resolves to.
             display_nodes = [node for node in sop_nodes if node.get("is_displayed")]
             if display_nodes:
                 display_type = str(display_nodes[0].get("type", "")).lower()
@@ -2192,6 +2492,72 @@ class AgentLoop:
                     )
 
         return issues
+
+    def _llm_structural_review(
+        self,
+        user_message: str,
+        before_snapshot: dict | None,
+        after_snapshot: dict | None,
+        parent_paths: list[str],
+        outputs: list[str],
+    ) -> list[dict]:
+        """Intelligent verification of the network structure without hardcoded node names."""
+        if not after_snapshot:
+            return []
+
+        goal_anchor = getattr(self, "_task_anchor", None) or user_message.strip()
+        if not goal_anchor or len(goal_anchor) < 3:
+            return []
+
+        # We only run this deep structural review for build tasks
+        request_mode, _ = self._classify_request_mode(user_message)
+        if request_mode != "build":
+            return []
+
+        after_nodes = after_snapshot.get("nodes", []) or []
+        nodes_summary = []
+        for n in after_nodes:
+            path = n.get("path")
+            ntype = n.get("type")
+            if path and ntype:
+                nodes_summary.append(f"{path} ({ntype})")
+
+        nodes_str = ", ".join(nodes_summary) if nodes_summary else "None"
+
+        system = (
+            "You are a Houdini structural verification assistant.\n"
+            "Evaluate if the user's goal was structurally completed by looking at the nodes present.\n"
+            "DO NOT enforce exact node names or a preselected workflow. Judge whether the scene graph semantically satisfies the requested result.\n"
+            "If the network structure appears to fulfill the major requirements of the goal, reply exactly with: OK\n"
+            "If essential structural steps are entirely missing (e.g., missing a solver for a simulation, or missing a fracture node for a destruction task), reply with a concise 1-sentence repair instruction.\n"
+            "Be lenient: trust that the agent did its best. Only fail if there is a glaring, undeniable gap in the logic."
+        )
+
+        prompt = (
+            f"GOAL: {goal_anchor}\n\n"
+            f"CURRENT NODES:\n{nodes_str}\n\n"
+            f"Are the required structural components present to fulfill this goal? Reply OK or provide a 1-sentence repair instruction."
+        )
+
+        try:
+            verdict = self.llm.chat_simple(
+                system=system, user=prompt, temperature=0.1, task="quick"
+            ).strip()
+
+            if verdict == "OK" or verdict.startswith("OK"):
+                return []
+
+            # If not OK, return it as a repair issue
+            target = parent_paths[0] if parent_paths else "/obj"
+            return [
+                {
+                    "severity": "repair",
+                    "path": target,
+                    "message": f"Structural review indicates missing steps: {verdict}",
+                }
+            ]
+        except Exception:
+            return []
 
     @staticmethod
     def _parse_goal_match_vision_report(raw: str | None) -> dict:
@@ -2352,7 +2718,7 @@ class AgentLoop:
     ) -> dict | None:
         if self.verify_skip_vision or not self.llm.vision_enabled:
             return None
-        if not after_snapshot or not _query_needs_workflow_grounding(user_message):
+        if not after_snapshot or not _asset_goal_terms(user_message):
             return None
 
         # Guard: if every display output node has no incoming wires the viewport
@@ -2480,7 +2846,7 @@ class AgentLoop:
             or self.verify_skip_vision
             or not self.llm.vision_enabled
             or not after_snapshot
-            or not _query_needs_workflow_grounding(user_message)
+            or not _asset_goal_terms(user_message)
         ):
             return None
 
@@ -2629,6 +2995,9 @@ class AgentLoop:
                     ],
                     "outputs": outputs,
                     "candidate_parents": parent_paths,
+                    "repair_context": self._format_existing_nodes_for_repair(
+                        after_snapshot, parent_paths, outputs
+                    ),
                     "network_review": None,
                     "semantic_review": None,
                     "semantic_scorecard": None,
@@ -2673,7 +3042,9 @@ class AgentLoop:
         )
         error_nodes = []
         if error_scan.get("status") == "ok":
-            error_nodes = list((error_scan.get("data") or {}).get("nodes", []) or [])
+            error_nodes = self._filter_scratch_error_nodes(
+                (error_scan.get("data") or {}).get("nodes", [])
+            )
             for node in error_nodes:
                 path = node.get("path")
                 if parent_paths and not any(
@@ -2890,18 +3261,26 @@ class AgentLoop:
             )
         )
         issues.extend(
-            self._table_support_verification_issues(
+            self._explicit_parameter_verification_issues(
                 user_message,
                 after_snapshot,
                 parent_paths,
                 stream_callback=stream_callback,
             )
         )
+        issues.extend(
+            self._llm_structural_review(
+                user_message,
+                before_snapshot,
+                after_snapshot,
+                parent_paths,
+                outputs,
+            )
+        )
 
-        # ── Spatial layout audit for furniture / multi-part builds ─────────────
-        # If the query is for a recognizable object (chair, table, bed, etc.) and
-        # audit_spatial_layout is available, run it and inject any at-origin nodes
-        # as repair issues. This catches legs stuck at Y=0 before the VLM check.
+        # ── Spatial layout audit for multi-part builds ────────────────────────
+        # For recognizable multi-part object requests, audit generic spatial
+        # relationships and inject any at-origin nodes as repair issues.
         if (
             request_mode == "build"
             and parent_paths
@@ -3129,6 +3508,15 @@ class AgentLoop:
                     }
                 )
 
+        if request_mode in {"build", "debug"} and not light_profile:
+            issues.extend(
+                self.simulation_health_phase.run(
+                    after_snapshot,
+                    parent_paths,
+                    stream_callback=stream_callback,
+                )
+            )
+
         blocking_issues = [
             i for i in issues if str(i.get("severity", "")).lower() in {"error", "repair"}
         ]
@@ -3148,6 +3536,9 @@ class AgentLoop:
             "issues": issues,
             "outputs": outputs,
             "candidate_parents": parent_paths,
+            "repair_context": self._format_existing_nodes_for_repair(
+                after_snapshot, parent_paths, outputs
+            ),
             "network_review": network_review,
             "semantic_review": semantic_review,
             "semantic_scorecard": semantic_scorecard,
@@ -3166,6 +3557,17 @@ class AgentLoop:
         self._last_turn_verification_text = report["text"]
         self._last_turn_output_paths = outputs
         self.debug_logger.log_system_note(report["text"])
+        self._record_workflow_event(
+            "verification",
+            {
+                "status": status,
+                "profile": profile,
+                "issue_count": len(issues),
+                "outputs": outputs[:6],
+                "candidate_parents": parent_paths[:6],
+                "summary": summary,
+            },
+        )
         self._emit_runtime_status(
             "verification",
             status=status,
@@ -3175,6 +3577,115 @@ class AgentLoop:
             prefix = "✅" if status == "pass" else "⚠️"
             stream_callback(f"\u200b{prefix} Verification {status}.\n\n")
         return report
+
+    def _simulation_health_check_issues(
+        self,
+        after_snapshot: dict,
+        parent_paths: list[str],
+        stream_callback: Callable | None = None,
+    ) -> list[dict]:
+        if not after_snapshot:
+            return []
+        nodes = after_snapshot.get("nodes", []) or []
+        candidates = []
+        for node in nodes:
+            path = str(node.get("path") or "")
+            if not path:
+                continue
+            if parent_paths and not any(self._path_under_parent(path, p) for p in parent_paths):
+                continue
+            node_type = str(node.get("type") or "").lower()
+            category = str(node.get("category") or "").lower()
+            if "solver" in node_type or "dop" in node_type or category == "dop":
+                candidates.append({"path": path, "type": node_type})
+        if not candidates:
+            return []
+
+        issues: list[dict] = []
+        for candidate in candidates[:6]:
+            path = candidate["path"]
+            sim_result = self._run_observation_tool(
+                "get_simulation_diagnostic",
+                {"solver_path": path},
+                stream_callback,
+            )
+            if sim_result.get("status") != "ok":
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "path": path,
+                        "message": (
+                            f"Simulation health diagnostic could not inspect {path}: "
+                            f"{sim_result.get('message', '')}"
+                        ),
+                    }
+                )
+                continue
+            data = sim_result.get("data") or {}
+            errors = data.get("errors") or []
+            warnings = data.get("warnings") or []
+            if errors:
+                issues.append(
+                    {
+                        "severity": "repair",
+                        "path": path,
+                        "message": f"Simulation solver has errors: {errors[0]}",
+                    }
+                )
+            elif warnings:
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "path": path,
+                        "message": f"Simulation solver warning: {warnings[0]}",
+                    }
+                )
+
+            stats_result = self._run_observation_tool(
+                "get_sim_stats",
+                {"solver_node_path": path},
+                stream_callback,
+            )
+            if stats_result.get("status") == "ok":
+                stats = stats_result.get("data") or {}
+                if stats.get("errors"):
+                    issues.append(
+                        {
+                            "severity": "repair",
+                            "path": path,
+                            "message": f"Simulation stats report errors: {stats['errors'][0]}",
+                        }
+                    )
+
+            if "flip" in candidate["type"] or "dop" in candidate["type"]:
+                flip_result = self._run_observation_tool(
+                    "get_flip_diagnostic",
+                    {"dopnet_path": path},
+                    stream_callback,
+                )
+                if flip_result.get("status") == "ok":
+                    flip_data = flip_result.get("data") or {}
+                    if flip_data.get("errors"):
+                        issues.append(
+                            {
+                                "severity": "repair",
+                                "path": path,
+                                "message": f"FLIP diagnostic reports errors: {flip_data['errors'][0]}",
+                            }
+                        )
+        if issues:
+            self.debug_logger.log_phase(
+                "simulation_health",
+                status="issues",
+                meta={"count": len(issues)},
+            )
+        else:
+            self.debug_logger.log_phase(
+                "simulation_health",
+                status="ok",
+                meta={"checked": len(candidates[:6])},
+            )
+        return issues
 
     @staticmethod
     def _truncate_prompt_context(text: str, limit: int = 4000) -> str:
@@ -3361,13 +3872,6 @@ class AgentLoop:
         if tool_name == "create_node_chain":
             created = [c.get("path") for c in data.get("created", []) if c.get("path")]
             return "Create chain: " + ", ".join(created[:6]) if created else "Create node chain"
-        if tool_name.startswith("setup_"):
-            paths = [str(v) for v in data.values() if isinstance(v, str) and v.startswith("/")]
-            return (
-                f"{tool_name}: " + ", ".join(paths[:6])
-                if paths
-                else tool_name.replace("_", " ").title()
-            )
         if tool_name == "create_material":
             return f"Create material {data.get('material_path', args.get('mat_name', '?'))}"
         if tool_name == "assign_material":
@@ -3378,8 +3882,6 @@ class AgentLoop:
             return f"Create camera {data.get('path', args.get('name', 'agent_cam'))}"
         if tool_name == "create_subnet":
             return f"Create subnet {data.get('subnet_path', args.get('name', '?'))}"
-        if tool_name == "create_bed_controls":
-            return f"Create controls {data.get('path', args.get('name', 'BED_CONTROLS'))}"
         if tool_name == "set_display_flag":
             return f"Set display output on {args.get('node_path', '?')}"
         if tool_name == "finalize_sop_network":
@@ -3432,9 +3934,6 @@ class AgentLoop:
         elif tool_name == "create_camera":
             name = args.get("name") or "agent_cam"
             data["path"] = cls._dry_run_path(args.get("parent_path", "/obj"), name)
-        elif tool_name == "create_bed_controls":
-            name = args.get("name") or "BED_CONTROLS"
-            data["path"] = cls._dry_run_path(args.get("parent_path", "/"), name)
         elif tool_name == "create_material":
             data["material_path"] = cls._dry_run_path("/mat", args.get("mat_name", "material1"))
         elif tool_name == "assign_material":
@@ -3461,57 +3960,6 @@ class AgentLoop:
             if created:
                 data["chain_head"] = created[0]["path"]
                 data["chain_tail"] = created[-1]["path"]
-        elif tool_name in {"setup_vellum_cloth", "setup_vellum_pillow"}:
-            parent = args.get("parent_path", "/")
-            if tool_name == "setup_vellum_cloth":
-                data.update(
-                    {
-                        "constraints": cls._dry_run_path(parent, "vellum_cloth_constraints"),
-                        "solver": cls._dry_run_path(parent, "vellum_solver"),
-                        "cache": cls._dry_run_path(parent, "vellum_cache"),
-                    }
-                )
-            else:
-                data.update(
-                    {
-                        "constraints": cls._dry_run_path(parent, "pillow_struts"),
-                        "solver": cls._dry_run_path(parent, "pillow_solver"),
-                    }
-                )
-        elif tool_name in {"setup_flip_fluid", "setup_pyro_sim", "setup_rbd_fracture"}:
-            parent = args.get("parent_path", "/")
-            if tool_name == "setup_flip_fluid":
-                data.update(
-                    {
-                        "source": cls._dry_run_path(parent, "flipsource1"),
-                        "dopnet": cls._dry_run_path(parent, "flip_dopnet"),
-                        "solver": cls._dry_run_path(
-                            cls._dry_run_path(parent, "flip_dopnet"), "flipsolver1"
-                        ),
-                        "surface": cls._dry_run_path(parent, "fluid_surface"),
-                    }
-                )
-            elif tool_name == "setup_pyro_sim":
-                data.update(
-                    {
-                        "source": cls._dry_run_path(parent, "pyrosource1"),
-                        "volume_rasterize": cls._dry_run_path(parent, "pyro_volume_rasterize"),
-                        "solver": cls._dry_run_path(parent, "pyrosolver1"),
-                        "postprocess": cls._dry_run_path(parent, "pyro_postprocess"),
-                        "output": cls._dry_run_path(parent, "pyro_out"),
-                        "mode": "sop",
-                        "rasterized_attributes": ["density", "temperature", "fuel", "v"],
-                    }
-                )
-            else:
-                data.update(
-                    {
-                        "fracture": cls._dry_run_path(parent, "fracture1"),
-                        "solver": cls._dry_run_path(parent, "rbd_bullet_solver"),
-                        "output": cls._dry_run_path(parent, "rbd_out"),
-                        "mode": "sop",
-                    }
-                )
         elif tool_name in {"safe_set_parameter", "set_parameter", "set_expression"}:
             data.update(
                 {
@@ -3547,11 +3995,6 @@ class AgentLoop:
     _LONG_HOU_WRITE_TIMEOUTS = {
         "create_node_chain": 180.0,
         "finalize_sop_network": 120.0,
-        "setup_pyro_sim": 240.0,
-        "setup_rbd_fracture": 240.0,
-        "setup_flip_fluid": 240.0,
-        "setup_vellum_cloth": 180.0,
-        "setup_vellum_pillow": 180.0,
         "bake_simulation": 300.0,
         "cook_network_range": 300.0,
         "layout_network": 90.0,
@@ -3611,8 +4054,9 @@ class AgentLoop:
     @staticmethod
     def _has_houdini_main_thread_dispatch() -> bool:
         try:
-            import hdefereval
+            import importlib
 
+            importlib.import_module("hdefereval")
             return True
         except ImportError:
             return False
@@ -3736,26 +4180,95 @@ class AgentLoop:
 
         # Stage 1: scene-grounded node existence check
         missing_nodes: list[str] = []
+        # Track expected (node_type, parent_path) for steps that named a type
+        # but no exact path, or whose path didn't match — we then check whether
+        # ANY child of the parent has that type, not just the exact name.
+        expected_types: list[tuple[str, str, str]] = []  # (node_type, parent_or_path, action)
         for phase in plan_data.get("phases", []):
             for step in phase.get("steps", []):
-                node_path = step.get("node_path", "")
-                if not node_path or not node_path.startswith("/obj"):
-                    continue
-                try:
-                    result = self._tool_executor("get_node_parameters", {"node_path": node_path})
-                    if isinstance(result, dict) and result.get("status") == "error":
-                        missing_nodes.append(
-                            f"Step {step.get('step')}: {step.get('action', '')} "
-                            f"— node {node_path} not found in scene"
+                node_path = step.get("node_path", "") or ""
+                node_type = (step.get("node_type", "") or "").strip().lower()
+                action = step.get("action", "") or ""
+                step_id = step.get("step")
+                if node_path and node_path.startswith("/obj"):
+                    try:
+                        result = self._tool_executor(
+                            "get_node_parameters", {"node_path": node_path}
                         )
-                except Exception:
-                    pass  # tool not available in this context
+                        if not (isinstance(result, dict) and result.get("status") != "error"):
+                            missing_nodes.append(
+                                f"Step {step_id}: {action} — node {node_path} not found in scene"
+                            )
+                    except Exception:
+                        pass
 
-        if missing_nodes:
-            joined = "\n".join(missing_nodes)
+                # If the step named a node_type, remember it for type-presence
+                # check below. This catches the case where the agent created
+                # a node of the right type but at a different path/name than
+                # the planner specified.
+                if node_type and node_type not in {"none", "n/a", "-"}:
+                    parent_hint = ""
+                    if node_path:
+                        parent_hint = node_path.rsplit("/", 1)[0] if "/" in node_path else ""
+                    expected_types.append((node_type, parent_hint or "/obj", action))
+
+        # Type-presence check: for each expected type, see if the scene has
+        # at least one node of that type under the expected parent. Lifts the
+        # node-name miss out of "missing" if a type-equivalent node exists.
+        type_misses: list[str] = []
+        if expected_types:
+            try:
+                snapshot = self._capture_scene_snapshot() if HOU_AVAILABLE else None
+            except Exception:
+                snapshot = None
+            scene_types_by_parent: dict[str, set[str]] = {}
+            if snapshot:
+                for node in snapshot.get("nodes", []) or []:
+                    n_path = node.get("path") or ""
+                    if self._is_scratch_path(n_path):
+                        continue
+                    n_type = (node.get("type") or "").strip().lower()
+                    if not n_path or not n_type:
+                        continue
+                    parent = n_path.rsplit("/", 1)[0] if "/" in n_path else ""
+                    scene_types_by_parent.setdefault(parent, set()).add(n_type)
+                    # Also index ancestors so a node of the right type below the
+                    # expected parent still counts.
+                    crumbs = parent.split("/")
+                    while len(crumbs) > 2:
+                        crumbs.pop()
+                        scene_types_by_parent.setdefault("/".join(crumbs), set()).add(n_type)
+
+            for n_type, parent_hint, action in expected_types:
+                # Already explicitly missing-by-path → don't double count
+                # if the type also missing; just record the type miss with a
+                # clearer hint.
+                under = scene_types_by_parent.get(parent_hint, set())
+                # Fallback: search under any /obj/<top> that contains the parent
+                if n_type not in under:
+                    matched = any(n_type in v for k, v in scene_types_by_parent.items())
+                    if not matched:
+                        type_misses.append(
+                            f"Plan called for a '{n_type}' node ({action.strip()[:80]}) "
+                            f"but no node of that type exists in the scene."
+                        )
+
+        if missing_nodes or type_misses:
+            joined_paths = "\n".join(missing_nodes)
+            joined_types = "\n".join(type_misses)
+            sections = []
+            if missing_nodes:
+                sections.append(f"Missing nodes ({len(missing_nodes)}):\n{joined_paths}")
+            if type_misses:
+                sections.append(f"Missing node types ({len(type_misses)}):\n{joined_types}")
+            joined = "\n\n".join(sections)
             return (
-                f"Plan verification found {len(missing_nodes)} node(s) missing from the scene:\n"
-                f"{joined}\n\nPlease create these nodes now before claiming success."
+                f"Plan verification found gaps between the plan and the scene:\n"
+                f"{joined}\n\n"
+                f"Create the missing nodes (or equivalents) now using the exact "
+                f"node_type the plan specified. Do NOT substitute a different "
+                f"approach — the plan was chosen for a reason. If you genuinely "
+                f"cannot use that node type, explain why before deviating."
             )
 
         # Stage 2: LLM text comparison for non-node steps
@@ -3815,8 +4328,26 @@ class AgentLoop:
         # Task anchor: persist the user's goal across history compression.
         # Refresh on every substantive user request so the anchor always
         # reflects what the user JUST asked for, not a stale earlier turn.
-        if len(user_message.strip()) > 20:
-            self._task_anchor = user_message.strip()[:600]
+        #
+        # ANCHOR-FIX: When the user is answering a clarification question from
+        # the previous assistant turn (e.g. "which method?" → "RBD Material
+        # Fracture"), do NOT replace the anchor with just the short answer —
+        # that erases the original task context ("create a table and fracture
+        # it") and causes the agent to forget what it was building.
+        # Instead, append the clarification as an addendum to the previous anchor.
+        _msg_stripped = user_message.strip()
+        if len(_msg_stripped) > 20:
+            _prev_anchor = getattr(self, "_task_anchor", None)
+            _is_clarification_answer = (
+                _prev_anchor is not None
+                and len(_msg_stripped) < 80  # short response
+                and self._last_assistant_was_question()
+            )
+            if _is_clarification_answer:
+                # Combine: keep original task, append user's clarification
+                self._task_anchor = f"{_prev_anchor} [{_msg_stripped}]"[:600]
+            else:
+                self._task_anchor = _msg_stripped[:600]
         # Strip permanent negative constraints from history so they don't poison future turns
         if "do NOT modify the scene" in interaction_message:
             interaction_message = interaction_message.replace(
@@ -3844,10 +4375,64 @@ class AgentLoop:
         )
         # OPT-1: log classification result so debug sessions show mode+confidence
         self.debug_logger.log_phase(
-            "classify", status="ok", meta={"mode": request_mode, "confidence": _conf}
+            "classify",
+            status="ok",
+            meta={
+                "mode": request_mode,
+                "confidence": _conf,
+            },
         )
+        self._start_workflow_run(user_message, request_mode)
         fast_turn = bool(getattr(self, "_fast_message_mode", False))
+
+        # ── User clarification channel ───────────────────────────────────
+        # If the request is too ambiguous to act on, ask one short question
+        # instead of guessing. Skipped in fast mode and dry runs.
+        if not fast_turn and not dry_run and getattr(self, "_clarifier", None) is not None:
+            recent_clar = bool(getattr(self, "_last_turn_was_clarification", False))
+            # Survive process restarts: scan the last assistant message for the flag.
+            if not recent_clar:
+                for msg in reversed(self.conversation):
+                    if msg.get("role") == "assistant":
+                        recent_clar = bool(msg.get("_clarification"))
+                        break
+            cdec = self._clarifier.should_clarify(
+                user_message,
+                request_mode,
+                recent_clarification_in_history=recent_clar,
+            )
+            self.debug_logger.log_phase(
+                "clarify",
+                status="ask" if cdec.ask else "skip",
+                meta={"reason": cdec.reason[:160], "mode": request_mode},
+            )
+            if cdec.ask:
+                clar_text = cdec.to_user_text()
+                # Append the exchange so the user's reply lands in proper context.
+                self.conversation.append({"role": "user", "content": user_message})
+                self.conversation.append(
+                    {"role": "assistant", "content": clar_text, "_clarification": True}
+                )
+                if self.memory_manager:
+                    try:
+                        self.memory_manager.save_conversation(self.conversation)
+                    except Exception:
+                        pass
+                self._last_turn_was_clarification = True
+                if stream_callback:
+                    stream_callback(clar_text)
+                self._finish_logged_interaction(interaction_id, clar_text)
+                self._finish_workflow_run(clar_text, success=True)
+                self._runtime_status_callback = previous_status_callback
+                return clar_text
+        # No clarification asked → reset the flag so a future ambiguous turn can ask again.
+        self._last_turn_was_clarification = False
+
         if fast_turn:
+            if stream_callback:
+                stream_callback(
+                    "\u200b⚡ Fast mode is on: planning/history extras are reduced, but final verification remains enabled.\n\n"
+                )
             self.debug_logger.log_phase(
                 "fast_mode",
                 status="enabled",
@@ -3859,11 +4444,13 @@ class AgentLoop:
                     ),
                     "skips": [
                         "planning",
-                        "rag_prefetch",
-                        "startup_scene_snapshot",
                         "llm_history_compression",
                         "workflow_grounding",
                         "project_rules",
+                    ],
+                    "kept": [
+                        "rag_prefetch(build)",
+                        "startup_scene_snapshot",
                         "post_build_verification",
                         "plan_completion_check",
                     ],
@@ -3911,7 +4498,8 @@ class AgentLoop:
                 current_snapshot = None
 
             if current_snapshot:
-                self.world_model.update_from_scene_snapshot(current_snapshot)
+                with self._world_model_lock:
+                    self.world_model.update_from_scene_snapshot(current_snapshot)
             if request_mode in {"build", "debug"}:
                 before_snapshot = current_snapshot
 
@@ -3947,11 +4535,12 @@ class AgentLoop:
                 )
             )
             if plan_data:
+                self._update_workflow_plan(plan_data)
                 steps_text = json.dumps(plan_data, indent=2)
                 plan_injection = (
                     f"\n\n[PROTOTYPE EXECUTION CONTRACT]\n{steps_text}\n\n"
                     "This plan is binding for the build. Convert its prototype measurements, counts, spacing, placement, and relationships into the actual scene edits.\n"
-                    "Do not silently rescale the object. If the plan says a tabletop is 4.0 units wide or four legs are 3.4 units apart, build that scale unless physically impossible.\n"
+                    "Do not silently rescale the object. Preserve explicit measurements, counts, spacing, placement, and symmetry unless physically impossible.\n"
                     "For every repeated part, create the requested count and preserve the requested spacing/symmetry.\n"
                     "Before your final answer, compare the built result against each plan validation line. If any line fails, fix it before claiming success.\n"
                     "After building, make sure the final visible output is merged if needed and ends at an OUT node."
@@ -3987,6 +4576,18 @@ class AgentLoop:
                 base_messages.insert(
                     len(base_messages) - 1, {"role": "system", "content": mode_guidance}
                 )
+            vex_guidance = self._build_vex_contract_guidance(user_message, request_mode)
+            if vex_guidance:
+                base_messages.insert(
+                    len(base_messages) - 1, {"role": "system", "content": vex_guidance}
+                )
+            if self._agentic_enabled:
+                agentic_contract = self._agentic_controller.format_operating_contract(request_mode)
+                if agentic_contract:
+                    base_messages.insert(
+                        len(base_messages) - 1,
+                        {"role": "system", "content": agentic_contract},
+                    )
             # Task anchor: re-inject original goal so it survives history compression.
             # Placed just before the current user message so it's always in context.
             if self._task_anchor:
@@ -3998,13 +4599,19 @@ class AgentLoop:
                     len(base_messages) - 1, {"role": "system", "content": anchor_msg}
                 )
 
-            # Fast mode: inject known node parameter schemas to prevent parm hallucination
-            if fast_turn:
+            # Inject known node parameter schemas to prevent parm hallucination.
+            if request_mode in {"build", "debug"}:
                 schema_hint = self._build_fast_schema_hint(user_message)
                 if schema_hint:
                     base_messages.insert(
                         len(base_messages) - 1, {"role": "system", "content": schema_hint}
                     )
+            rag20_live_hint = self._build_rag20_live_schema_hint(user_message)
+            if rag20_live_hint:
+                base_messages.insert(
+                    len(base_messages) - 1,
+                    {"role": "system", "content": rag20_live_hint},
+                )
             if workflow_grounding:
                 base_messages.insert(
                     len(base_messages) - 1,
@@ -4014,6 +4621,16 @@ class AgentLoop:
             if project_rules:
                 base_messages.insert(
                     len(base_messages) - 1, {"role": "system", "content": project_rules}
+                )
+            cognitive_memory = (
+                ""
+                if fast_turn
+                else self._build_cognitive_memory_guidance(user_message, request_mode)
+            )
+            if cognitive_memory:
+                base_messages.insert(
+                    len(base_messages) - 1,
+                    {"role": "system", "content": cognitive_memory},
                 )
             if dry_run:
                 base_messages.insert(
@@ -4037,6 +4654,11 @@ class AgentLoop:
             if delta_injection:
                 base_messages[-1] = {"role": "user", "content": augmented_message}
             if plan_injection:
+                self.debug_logger.log_phase(
+                    "agentic_plan_state",
+                    status="initialized",
+                    meta=summarize_agentic_plan(plan_data),
+                )
                 base_messages.insert(
                     len(base_messages) - 1,
                     {"role": "system", "content": plan_injection.strip()},
@@ -4102,9 +4724,17 @@ class AgentLoop:
             # to decrement — it enforces the hard floor at zero.
             self._turn_repair_budget = max(0, int(self.max_auto_repairs))
 
-            # Self-correction: if build request made no edits, retry once
-            if self._should_retry_build_turn(request_mode, response_text, dry_run=dry_run):
-                self.debug_logger.log_system_note("Build self-correction: no write tools executed.")
+            # Self-correction: retry once when no edits landed, or when fast mode only
+            # created scaffolding for a simple primitive request.
+            if self._should_retry_build_turn(
+                request_mode,
+                response_text,
+                dry_run=dry_run,
+                user_message=user_message,
+            ):
+                self.debug_logger.log_system_note(
+                    "Build self-correction: no write tools executed or fast build incomplete."
+                )
                 if stream_callback:
                     stream_callback(
                         "\u200b⚠️ No scene edits detected. Retrying in builder mode…\n\n"
@@ -4121,6 +4751,7 @@ class AgentLoop:
                     dry_run=dry_run,
                     request_mode=request_mode,
                     plan_data=plan_data,
+                    _depth=1,
                 )
 
             after_snapshot = None
@@ -4152,7 +4783,6 @@ class AgentLoop:
                 and not dry_run
                 and not transient_llm_failure
                 and self._last_turn_write_tools
-                and not fast_turn
                 and not hou_blocked
             ):
                 after_snapshot = after_snapshot or self._capture_scene_snapshot()
@@ -4178,9 +4808,7 @@ class AgentLoop:
 
                     critic_note = ""
                     try:
-                        if locals().get("plan_data") and self.config.get(
-                            "enable_repair_critic", False
-                        ):
+                        if locals().get("plan_data") and self._critic_enabled:
                             if stream_callback:
                                 stream_callback(
                                     "\u200b🔍 Critic LLM analyzing failure root cause…\n\n"
@@ -4200,15 +4828,25 @@ class AgentLoop:
                             "critic_error", status="warn", meta={"error": str(e)[:100]}
                         )
 
+                    scene_context = ""
+                    try:
+                        scene_context = self.world_model.to_prompt_context()
+                    except Exception:
+                        scene_context = ""
+                    repair_content, repair_plan = self._build_replan_repair_message(
+                        user_message,
+                        verification_report,
+                        scene_context=scene_context,
+                        previous_plan=plan_data,
+                    )
+                    if repair_plan:
+                        plan_data = repair_plan
                     repair_messages = [
                         *list(full_messages),
                         {"role": "assistant", "content": response_text},
                         {
                             "role": "user",
-                            "content": self._build_verification_repair_message(
-                                user_message, verification_report
-                            )
-                            + critic_note,
+                            "content": repair_content + critic_note,
                         },
                     ]
                     response_text = self._run_loop(
@@ -4218,6 +4856,7 @@ class AgentLoop:
                         dry_run=False,
                         request_mode="debug",
                         plan_data=plan_data,
+                        _depth=1,
                     )
                     hou_blocked = bool(getattr(self, "_turn_hou_main_thread_blocked", False))
                     after_snapshot = None if hou_blocked else self._capture_scene_snapshot()
@@ -4429,6 +5068,7 @@ class AgentLoop:
                         dry_run=False,
                         request_mode="debug",
                         plan_data=plan_data,
+                        _depth=1,
                     )
                     hou_blocked = bool(getattr(self, "_turn_hou_main_thread_blocked", False))
                     after_snapshot = None if hou_blocked else self._capture_scene_snapshot()
@@ -4544,6 +5184,13 @@ class AgentLoop:
                     dry_run=dry_run,
                 )
 
+            self._remember_turn_outcome(
+                user_message=user_message,
+                response_text=response_text,
+                request_mode=request_mode,
+                scene_diff_text=scene_diff_text,
+            )
+            self._finish_workflow_run(response_text, success=True)
             self.debug_logger.log_response(response_text)
             self.conversation.append({"role": "assistant", "content": response_text})
             self._emit_runtime_status(
@@ -4555,13 +5202,32 @@ class AgentLoop:
         except Exception as e:
             response_text = f"⚠️ Agent Error: {e}"
             self.debug_logger.log_system_note(response_text)
+            # HARDENING: log full traceback for debugging but never re-raise
+            # to the UI. Re-raising kills the Python Panel's worker thread
+            # and forces the user to restart the panel.
+            self.debug_logger.log_exception(
+                context="chat_outer",
+                exc=e,
+                stack_trace=_traceback.format_exc(),
+            )
             self._emit_runtime_status(
                 "turn_complete",
                 request_mode=request_mode if "request_mode" in locals() else "advice",
                 success=False,
                 error=str(e),
             )
-            raise
+            try:
+                self._remember_turn_outcome(
+                    user_message=user_message,
+                    response_text=response_text,
+                    request_mode=request_mode if "request_mode" in locals() else "advice",
+                    scene_diff_text=getattr(self, "_last_turn_scene_diff_text", "") or "",
+                )
+                self._finish_workflow_run(response_text, success=False)
+            except Exception:
+                pass
+            self.conversation.append({"role": "assistant", "content": response_text})
+            return response_text
         finally:
             self._runtime_status_callback = previous_status_callback
             self._finish_logged_interaction(interaction_id, response_text)
@@ -4594,7 +5260,7 @@ class AgentLoop:
         # or a reference image the user wants to recreate. The heuristic: if the user
         # message contains build intent words, treat it as a reference object image.
         _build_words = re.compile(
-            r"\b(create|build|make|model|recreate|reproduce|match|replicate|based on|like this|this chair|this object)\b",
+            r"\b(create|build|make|model|recreate|reproduce|match|replicate|based on|like this|this object)\b",
             re.IGNORECASE,
         )
         _is_reference_image = bool(_build_words.search(user_message))
@@ -4755,7 +5421,9 @@ class AgentLoop:
                         f"- {issue.get('severity', 'warning').upper()}: {issue.get('message', '')}"
                     )
             if error_scan.get("status") == "ok":
-                nodes = (error_scan.get("data") or {}).get("nodes", [])[:6]
+                nodes = self._filter_scratch_error_nodes(
+                    (error_scan.get("data") or {}).get("nodes", [])
+                )[:6]
                 if nodes:
                     lines.append("")
                     lines.append("Houdini-reported issues:")
@@ -4971,8 +5639,17 @@ class AgentLoop:
                 exec_messages.insert(
                     len(exec_messages) - 1, {"role": "system", "content": project_rules}
                 )
+            cognitive_memory = self._build_cognitive_memory_guidance(
+                original_query,
+                request_mode,
+            )
+            if cognitive_memory:
+                exec_messages.insert(
+                    len(exec_messages) - 1,
+                    {"role": "system", "content": cognitive_memory},
+                )
 
-            if self.rag:
+            if self.rag or self._ensure_rag_loaded():
                 # P2-A: use the prefetch result when the background thread finished
                 # in time, avoiding a redundant synchronous retrieval on the hot path.
                 _prefetch_ready = (
@@ -5014,6 +5691,8 @@ class AgentLoop:
                 self._finish_logged_interaction(interaction_id, full_response)
 
     # ── Internal loop ─────────────────────────────────────────────────
+    _MAX_LOOP_DEPTH = 3  # HARDENING: prevent unbounded recursive _run_loop calls
+
     def _run_loop(
         self,
         messages: list,
@@ -5022,8 +5701,25 @@ class AgentLoop:
         dry_run: bool = False,
         request_mode: str = "advice",
         plan_data: dict | None = None,
+        _depth: int = 0,
     ) -> str:
+        # HARDENING: recursion depth guard — repair, validation, and plan-completion
+        # paths all call _run_loop recursively.  Without a ceiling this could
+        # stack-overflow when the LLM keeps triggering repair cascades.
+        if _depth >= self._MAX_LOOP_DEPTH:
+            self.debug_logger.log_system_note(
+                f"_run_loop recursion depth {_depth} >= {self._MAX_LOOP_DEPTH}, returning early"
+            )
+            # Still return a useful summary if we made scene edits
+            if hasattr(self, "_last_turn_write_tools") and self._last_turn_write_tools:
+                return (
+                    "Reached maximum repair depth. Scene edits were applied. "
+                    "Please review the scene and provide further instructions."
+                )
+            return "Reached maximum repair depth. Please review the scene and provide further instructions."
+
         current_messages = list(messages)
+        self._current_loop_depth = _depth
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 3
         tool_history: list[str] = []
@@ -5059,6 +5755,23 @@ class AgentLoop:
                 status="info",
                 meta={"round": round_num, "mode": request_mode},
             )
+
+            # ── Budget gate ──────────────────────────────────────────────
+            # Stop cleanly if wall-clock or token budget for this turn ran out.
+            if getattr(self, "_turn_budget", None) is not None:
+                exhausted, reason = self._turn_budget.is_exhausted()
+                if exhausted:
+                    self.debug_logger.log_phase(
+                        "budget",
+                        status="exhausted",
+                        meta=self._turn_budget.snapshot(),
+                    )
+                    self._finalize_turn_tracking(tool_history, write_tools)
+                    return (
+                        f"⏸ Stopped early: {reason} "
+                        "Partial progress preserved. Re-issue with adjusted "
+                        "scope or raise the budget in core_config.json."
+                    )
 
             llm_task = self._select_loop_task(request_mode, round_num, consecutive_errors)
             _llm_t0 = time.time()
@@ -5100,13 +5813,63 @@ class AgentLoop:
                     except Exception:
                         pass
 
-                msg = self.llm.chat(
-                    current_messages,
-                    tools=active_schemas,
-                    task=llm_task,
-                    timeout_s=llm_timeout_s,
-                    chunk_callback=_live_token,
-                )
+                # Budget bookkeeping: record input tokens before the call.
+                if getattr(self, "_turn_budget", None) is not None:
+                    try:
+                        in_tok = count_message_tokens(current_messages, model=self.llm.model)
+                    except Exception:
+                        in_tok = 0
+                    if in_tok:
+                        self._turn_budget.record_tokens(in_tokens=in_tok)
+
+                # HARDENING: retry transient LLM failures with exponential backoff
+                # before giving up. Avoids losing entire turns to momentary Ollama hiccups.
+                _LLM_RETRY_DELAYS = [2.0, 5.0, 10.0]
+                _llm_last_exc = None
+                for _retry_i in range(len(_LLM_RETRY_DELAYS) + 1):
+                    try:
+                        msg = self.llm.chat(
+                            current_messages,
+                            tools=active_schemas,
+                            task=llm_task,
+                            timeout_s=llm_timeout_s,
+                            chunk_callback=_live_token,
+                        )
+                        _llm_last_exc = None
+                        # Budget bookkeeping: record output tokens.
+                        if getattr(self, "_turn_budget", None) is not None and msg:
+                            try:
+                                out_tok = count_tokens(
+                                    str(msg.get("content") or ""),
+                                    model=self.llm.model,
+                                )
+                            except Exception:
+                                out_tok = 0
+                            if out_tok:
+                                self._turn_budget.record_tokens(out_tokens=out_tok)
+                        break  # success
+                    except Exception as _llm_exc:
+                        _llm_last_exc = _llm_exc
+                        # Non-transient errors (e.g. HTTP 400 bad schema) propagate immediately
+                        if not self._is_transient_llm_failure(str(_llm_exc)):
+                            break
+                        if _retry_i >= len(_LLM_RETRY_DELAYS):
+                            break  # final retry exhausted
+                        _delay = _LLM_RETRY_DELAYS[_retry_i]
+                        self.debug_logger.log_system_note(
+                            f"LLM call failed (attempt {_retry_i + 1}/{len(_LLM_RETRY_DELAYS) + 1}): "
+                            f"{_llm_exc}. Retrying in {_delay}s..."
+                        )
+                        if stream_callback:
+                            stream_callback(
+                                f"\u200b\u23f3 LLM temporarily unavailable, retrying in {_delay:.0f}s...\n"
+                            )
+                        time.sleep(_delay)
+                        _llm_t0 = time.time()  # reset timer for the retry
+                        _streamed_any["v"] = False  # reset streaming flag
+
+                if _llm_last_exc is not None:
+                    raise _llm_last_exc
                 _llm_elapsed = int((time.time() - _llm_t0) * 1000)
                 text = msg.get("content", "") or ""
 
@@ -5153,6 +5916,17 @@ class AgentLoop:
                         tool_history, write_tools, mutation_summaries, dry_run
                     )
                     return fallback
+                # HARDENING: Even if _should_use_local_response_fallback returned
+                # False, if we already made scene edits preserve them in the
+                # response so the user sees what was done before the LLM died.
+                if write_tools and mutation_summaries:
+                    self._finalize_turn_tracking(
+                        tool_history, write_tools, mutation_summaries, dry_run
+                    )
+                    return (
+                        f"⚠️ LLM connection failed ({str(e)[:100]}), but scene edits were applied.\n\n"
+                        + self._format_mutation_summary(mutation_summaries)
+                    )
                 self._finalize_turn_tracking(tool_history, write_tools, mutation_summaries, dry_run)
                 return f"⚠️ {e}"
 
@@ -5207,6 +5981,47 @@ class AgentLoop:
             )
 
             if not tool_calls:
+                if self._agentic_enabled and not getattr(self, "_turn_validation_failed", False):
+                    agentic_decision = self._agentic_controller.decide_after_text(
+                        request_mode=request_mode,
+                        dry_run=dry_run,
+                        round_num=round_num,
+                        max_tool_rounds=self.max_tool_rounds,
+                        plan_data=plan_data,
+                        tool_history=tool_history,
+                        write_tools=write_tools,
+                        assistant_response=text,
+                        enforce_plan_completion=self._agentic_enforce_plan_completion,
+                        has_unresolved_tool_failures=bool(failed_attempts),
+                    )
+                    self.debug_logger.log_phase(
+                        "agentic_decision",
+                        status="continue" if agentic_decision.should_continue else "allow",
+                        meta={
+                            "round": round_num,
+                            "reason": agentic_decision.reason,
+                            "next_step": (
+                                agentic_decision.next_step.action
+                                if agentic_decision.next_step
+                                else None
+                            ),
+                        },
+                    )
+                    if agentic_decision.should_continue:
+                        current_messages.append({"role": "assistant", "content": text})
+                        current_messages.append(
+                            {"role": "system", "content": agentic_decision.message}
+                        )
+                        self._emit_progress(
+                            stream_callback,
+                            "I caught an early text-only stop; continuing with the next tool action.",
+                        )
+                        if stream_callback:
+                            stream_callback(
+                                "\u200b🧭 Agentic controller: continuing with the next required action.\n\n"
+                            )
+                        continue
+
                 # ── Phase 3: Post-Build QA Validation ──
                 # If we mutated the scene, trigger the ValidatorAgent to ensure
                 # no cook errors or disconnected sequences exist before returning.
@@ -5249,7 +6064,30 @@ class AgentLoop:
                             val_msg += f"Issues found: {'; '.join(issues)}\n"
                         if suggestions:
                             val_msg += f"Suggestions: {'; '.join(suggestions)}\n"
-                        val_msg += "Fix these issues now before considering the task complete."
+                        validation_report = {
+                            "status": "fail",
+                            "summary": "ValidatorAgent found issues after the build loop.",
+                            "issues": [
+                                {"severity": "repair", "path": "", "message": str(issue)}
+                                for issue in issues
+                            ],
+                        }
+                        try:
+                            repair_context = self.world_model.to_prompt_context()
+                        except Exception:
+                            repair_context = ""
+                        replan_message, repair_plan = self._build_replan_repair_message(
+                            _goal,
+                            validation_report,
+                            scene_context=repair_context,
+                            previous_plan=plan_data,
+                        )
+                        if repair_plan:
+                            plan_data = repair_plan
+                        val_msg += (
+                            "Fix these issues now before considering the task complete.\n\n"
+                            + replan_message
+                        )
 
                         if stream_callback:
                             stream_callback(
@@ -5279,6 +6117,7 @@ class AgentLoop:
                             dry_run=dry_run,
                             request_mode=request_mode,
                             plan_data=plan_data,
+                            _depth=_depth + 1,
                         )
 
                 # If the backend buffered (no per-token callback fired) emit
@@ -5327,7 +6166,6 @@ class AgentLoop:
                     request_mode == "build"
                     and not dry_run
                     and plan_data
-                    and not getattr(self, "_fast_message_mode", False)
                     and round_num < self.max_tool_rounds - 1
                     and self._plan_verification_count < 2
                 ):
@@ -5354,6 +6192,7 @@ class AgentLoop:
                             dry_run=dry_run,
                             request_mode=request_mode,
                             plan_data=plan_data,
+                            _depth=_depth + 1,
                         )
 
                 self._finalize_turn_tracking(tool_history, write_tools, mutation_summaries, dry_run)
@@ -5375,10 +6214,50 @@ class AgentLoop:
 
             def _execute_single_tool(
                 idx: int, tc: dict, *, concurrent: bool = False
-            ) -> tuple[int, dict]:
+            ) -> tuple[int, str, str, dict, str, dict]:
                 tool_name = tc.get("function", {}).get("name", "").strip(" \"'")
                 raw_args = tc.get("function", {}).get("arguments", {})
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except (TypeError, json.JSONDecodeError) as exc:
+                    return (
+                        idx,
+                        str(tc.get("id") or ""),
+                        tool_name,
+                        {"_raw_arguments": str(raw_args)[:1000]},
+                        "",
+                        {
+                            "status": "error",
+                            "message": (
+                                "Argument JSON parsing failed: "
+                                f"{exc}. Re-emit this tool call with valid JSON object arguments."
+                            ),
+                            "data": None,
+                            "_correction_hint": (
+                                "Tool arguments must be a valid JSON object string, "
+                                "with quoted keys and no trailing commas."
+                            ),
+                        },
+                    )
+                if not isinstance(args, dict):
+                    return (
+                        idx,
+                        str(tc.get("id") or ""),
+                        tool_name,
+                        {"_raw_arguments": args},
+                        "",
+                        {
+                            "status": "error",
+                            "message": (
+                                "Argument validation failed: tool arguments must be a JSON object, "
+                                f"not {type(args).__name__}."
+                            ),
+                            "data": None,
+                            "_correction_hint": (
+                                "Re-call the tool with an object containing the schema fields."
+                            ),
+                        },
+                    )
                 attempt_sig = self._tool_attempt_signature(tool_name, args)
                 prior_failure = failed_attempts.get(attempt_sig)
                 if (
@@ -5394,9 +6273,16 @@ class AgentLoop:
                     # is emitted later from _process_result in index order.
                     cb = None if concurrent else stream_callback
                     res = self._execute_tool(tool_name, args, cb, dry_run=dry_run)
-                return idx, tool_name, args, attempt_sig, res
+                return idx, str(tc.get("id") or ""), tool_name, args, attempt_sig, res
 
-            def _process_result(idx: int, tool_name: str, args: dict, attempt_sig: str, res: dict):
+            def _process_result(
+                idx: int,
+                tool_call_id: str,
+                tool_name: str,
+                args: dict,
+                attempt_sig: str,
+                res: dict,
+            ):
                 nonlocal consecutive_errors
                 nonlocal successful_tools_this_round
                 nonlocal hard_timeout_this_round
@@ -5412,6 +6298,17 @@ class AgentLoop:
                         arg_str = arg_str[:240].rstrip() + "…"
                     stream_callback(f"\u200b🔧 {tool_name}({arg_str})\n")
                 self.debug_logger.log_tool_call(tool_name, args, res)
+                self._record_workflow_event(
+                    "tool_result",
+                    {
+                        "round": round_num,
+                        "tool": tool_name,
+                        "args": args,
+                        "status": res.get("status"),
+                        "message": str(res.get("message", ""))[:500],
+                        "write_epoch": self._turn_scene_write_epoch,
+                    },
+                )
                 if "UNDO_TRACK:" in res.get("message", ""):
                     self.undo_stack.append(res["message"].replace("UNDO_TRACK: ", ""))
                 if self.memory:
@@ -5473,17 +6370,22 @@ class AgentLoop:
                         stream_callback(
                             f"\u200b{prefix} {tool_name} → {res.get('message', 'OK')[:120]}\n"
                         )
-                current_messages.append({"role": "tool", "content": json.dumps(res)})
+                tool_msg = {"role": "tool", "content": json.dumps(res)}
+                if tool_call_id:
+                    tool_msg["tool_call_id"] = tool_call_id
+                current_messages.append(tool_msg)
 
             if len(tool_calls) == 1:
-                idx, tool_name, args, attempt_sig, res = _execute_single_tool(0, tool_calls[0])
+                idx, tool_call_id, tool_name, args, attempt_sig, res = _execute_single_tool(
+                    0, tool_calls[0]
+                )
                 if self._cancel_event.is_set():
                     self._cancel_event.clear()
                     self._finalize_turn_tracking(
                         tool_history, write_tools, mutation_summaries, dry_run
                     )
                     return "⏹ Task cancelled by user."
-                _process_result(idx, tool_name, args, attempt_sig, res)
+                _process_result(idx, tool_call_id, tool_name, args, attempt_sig, res)
             else:
                 read_only_batch = [
                     (i, tc)
@@ -5512,11 +6414,20 @@ class AgentLoop:
 
                         for future in as_completed(futures):
                             try:
-                                idx, tool_name, args, attempt_sig, res = future.result()
-                                tool_results[idx] = (tool_name, args, attempt_sig, res)
+                                idx, tool_call_id, tool_name, args, attempt_sig, res = (
+                                    future.result()
+                                )
+                                tool_results[idx] = (
+                                    tool_call_id,
+                                    tool_name,
+                                    args,
+                                    attempt_sig,
+                                    res,
+                                )
                             except Exception as exc:
                                 i = futures[future]
                                 tool_results[i] = (
+                                    "",
                                     None,
                                     None,
                                     None,
@@ -5533,8 +6444,10 @@ class AgentLoop:
                             tool_history, write_tools, mutation_summaries, dry_run
                         )
                         return "⏹ Task cancelled by user."
-                    idx, tool_name, args, attempt_sig, res = _execute_single_tool(i, tc)
-                    tool_results[idx] = (tool_name, args, attempt_sig, res)
+                    idx, tool_call_id, tool_name, args, attempt_sig, res = _execute_single_tool(
+                        i, tc
+                    )
+                    tool_results[idx] = (tool_call_id, tool_name, args, attempt_sig, res)
 
                 for i, tc in enumerate(tool_calls):
                     if self._cancel_event.is_set():
@@ -5544,9 +6457,9 @@ class AgentLoop:
                         )
                         return "⏹ Task cancelled by user."
                     if i in tool_results:
-                        tool_name, args, attempt_sig, res = tool_results[i]
+                        tool_call_id, tool_name, args, attempt_sig, res = tool_results[i]
                         if tool_name:
-                            _process_result(i, tool_name, args, attempt_sig, res)
+                            _process_result(i, tool_call_id, tool_name, args, attempt_sig, res)
 
             if hard_timeout_this_round:
                 self._turn_hou_main_thread_blocked = True
@@ -5624,24 +6537,68 @@ class AgentLoop:
                                 "count": _error_signature_counts[sig],
                             },
                         )
-                        self._finalize_turn_tracking(
-                            tool_history, write_tools, mutation_summaries, dry_run
+                        # Reset the counter so the guard can fire again if needed,
+                        # then inject a forced approach-change message instead of
+                        # giving up — the agent must try a different strategy and
+                        # still complete the original goal.
+                        _error_signature_counts[sig] = 0
+                        _stag_goal = getattr(self, "_task_anchor", None) or ""
+                        _stag_done = [t for t in tool_history if t not in READ_ONLY_TOOLS]
+                        _stag_resume = ""
+                        if _stag_goal:
+                            _stag_resume = f"\nYOUR GOAL IS STILL: {_stag_goal}"
+                        if _stag_done:
+                            _stag_resume += f"\nAlready completed: {', '.join(_stag_done[-8:])}"
+                        current_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"⚠️ STUCK: `{e.get('tool', '')}` has failed the same way "
+                                    f"{MAX_SAME_ERROR_REPEATS} times in a row.\n"
+                                    f"Error: {e.get('error', '')[:200]}\n\n"
+                                    "You MUST try a completely different approach to this step:\n"
+                                    "• Use verify_node_type() or resolve_build_hints() to find the correct type/parm name\n"
+                                    "• Try an alternative tool or node type that achieves the same result\n"
+                                    "• Skip this specific step if it is optional and continue with the next one\n"
+                                    "Do NOT repeat the same failing call again."
+                                    + _stag_resume
+                                    + "\nAfter resolving this, continue building until the goal is complete."
+                                ),
+                            }
                         )
-                        return (
-                            f"Stopped: the same error repeated {MAX_SAME_ERROR_REPEATS}+ times without progress.\n"
-                            f"Stuck on: `{e.get('tool', '')}` — {e.get('error', '')[:120]}\n"
-                            "Try rephrasing your request or check node/parameter names."
-                        )
+                        if stream_callback:
+                            stream_callback(
+                                f"​⚠️ Stagnation detected on `{e.get('tool', '')}` — forcing approach change…\n"
+                            )
+                        break  # one stagnation injection per round is enough
                 if no_progress_failure_round and consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     err_summary = "; ".join(e["error"][:80] for e in all_errors_this_round)
-                    self._finalize_turn_tracking(
-                        tool_history, write_tools, mutation_summaries, dry_run
+                    _cons_goal = getattr(self, "_task_anchor", None) or ""
+                    _cons_done = [t for t in tool_history if t not in READ_ONLY_TOOLS]
+                    _cons_resume = ""
+                    if _cons_goal:
+                        _cons_resume = f"\n\nYOUR GOAL: {_cons_goal}"
+                    if _cons_done:
+                        _cons_resume += f"\nAlready completed: {', '.join(_cons_done[-8:])}"
+                    current_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"⚠️ {consecutive_errors} consecutive rounds of tool failures.\n"
+                                f"Errors: {err_summary}\n\n"
+                                "Change strategy — try:\n"
+                                "• verify_node_type() to confirm node type strings\n"
+                                "• resolve_build_hints() for correct parm names\n"
+                                "• A simpler equivalent approach\n"
+                                "Do NOT stop. Fix and continue the goal." + _cons_resume
+                            ),
+                        }
                     )
-                    return (
-                        f"Stopped after {consecutive_errors} consecutive tool failures.\n"
-                        f"Last errors: {err_summary}\n"
-                        "Check node type strings and parameter names and try again."
-                    )
+                    consecutive_errors = 0  # reset so the loop can continue
+                    if stream_callback:
+                        stream_callback(
+                            "​⚠️ Consecutive failures — injecting strategy-change prompt…\n"
+                        )
                 retry_lines = [
                     f"- Tool `{e['tool']}` with args {e['args']} failed: {e['error']}"
                     for e in all_errors_this_round
@@ -5695,6 +6652,22 @@ class AgentLoop:
                         + "\nDo NOT call the same tool again with null values. Fill every required field with a real value."
                     )
 
+                # Build a "what comes next" summary from tool history so the LLM
+                # knows where it is in the plan after fixing the error.
+                _goal_anchor = getattr(self, "_task_anchor", None) or ""
+                _done_tools = [t for t in tool_history if t not in READ_ONLY_TOOLS]
+                _resume_section = ""
+                if _goal_anchor:
+                    _resume_section = f"\n\nYOUR GOAL: {_goal_anchor}"
+                if _done_tools:
+                    _resume_section += "\n\nWHAT YOU ALREADY DID (do NOT redo these): " + ", ".join(
+                        _done_tools[-8:]
+                    )
+                _resume_section += (
+                    "\n\nAFTER FIXING: resume the goal above — apply the remaining steps "
+                    "in order. Do NOT stop after the fix."
+                )
+
                 # Fast mode: emit a single tight fix-hint when latency matters.
                 use_tight_hint = bool(getattr(self, "_fast_execution", False))
                 if use_tight_hint:
@@ -5718,6 +6691,7 @@ class AgentLoop:
                                 + network_retry_note
                                 + "\n\nRules: fix only the failed argument, do not restart, "
                                 "do not re-read what already succeeded, do not repeat the same call."
+                                + _resume_section
                             ),
                         }
                     )
@@ -5736,6 +6710,7 @@ class AgentLoop:
                                 "• Unsure whether the build is visible? Call inspect_display_output().\n"
                                 "• After correcting, continue the plan — do NOT restart from scratch.\n"
                                 "• Do NOT stop — keep going through the remaining planned steps."
+                                + _resume_section
                             ),
                         }
                     )
@@ -5774,6 +6749,50 @@ class AgentLoop:
 
         self._turn_failed_attempts = dict(failed_attempts)
         self._finalize_turn_tracking(tool_history, write_tools, mutation_summaries, dry_run)
+
+        # HARDENING: Round limit reached — if we have a plan and it's incomplete,
+        # attempt one continuation pass instead of giving up.
+        if (
+            plan_data
+            and write_tools
+            and not dry_run
+            and request_mode == "build"
+            and _depth < self._MAX_LOOP_DEPTH
+            and not getattr(self, "_exhaustion_continuation_attempted", False)
+        ):
+            reminder = self._verify_plan_completion(plan_data, tool_history, "")
+            if reminder:
+                self._exhaustion_continuation_attempted = True
+                self.debug_logger.log_system_note(
+                    "Round limit reached but plan incomplete — attempting continuation"
+                )
+                if stream_callback:
+                    stream_callback(
+                        "\u200b🔁 Round limit reached but task isn't done — continuing…\n\n"
+                    )
+                continuation_messages = [
+                    *list(messages[:2]),  # system + first user message
+                    *current_messages[-6:],  # recent context
+                    {
+                        "role": "system",
+                        "content": (
+                            f"[ROUND LIMIT CONTINUATION]\n"
+                            f"You hit the tool round limit but the task is NOT done.\n"
+                            f"Remaining steps:\n{reminder}\n\n"
+                            f"Complete ONLY the remaining steps. Do NOT repeat finished work."
+                        ),
+                    },
+                ]
+                return self._run_loop(
+                    continuation_messages,
+                    stream_callback,
+                    tool_schemas=tool_schemas,
+                    dry_run=dry_run,
+                    request_mode=request_mode,
+                    plan_data=plan_data,
+                    _depth=_depth + 1,
+                )
+
         if write_tools:
             output_paths = []
             snapshot = self._capture_scene_snapshot() if HOU_AVAILABLE else None
@@ -5948,6 +6967,80 @@ class AgentLoop:
                 "_correction_hint": correction,
             }
 
+        # ── Tool preconditions (cheap pre-call sanity checks) ───────────
+        # Uses the cached scene snapshot if one is available; never forces a
+        # fresh snapshot because we're on the dispatcher hot path.
+        if not dry_run and getattr(self, "preconditions_enabled", True):
+            cached_snapshot = (
+                self._turn_snapshot_cache.get(self._turn_scene_write_epoch)
+                if hasattr(self, "_turn_snapshot_cache")
+                else None
+            )
+            try:
+                pre = _preconditions.evaluate(tool_name, args, scene_snapshot=cached_snapshot)
+            except Exception as _pre_e:
+                # Preconditions must never break tool execution.
+                pre = _preconditions.PreconditionResult.passed()
+                self.debug_logger.log_system_note(
+                    f"[PRECONDITIONS] check raised {_pre_e!r} — passing through."
+                )
+            if not pre.ok and pre.severity == "block":
+                self.debug_logger.log_phase(
+                    "precondition",
+                    status="block",
+                    meta={"tool": tool_name, "reason": pre.message[:200]},
+                )
+                return {
+                    "status": "error",
+                    "message": _preconditions.format_failure(pre),
+                    "data": None,
+                    "_meta": {
+                        "dry_run": dry_run,
+                        "safety": safety_level,
+                        "precondition": True,
+                    },
+                    "_correction_hint": pre.suggested_fix or pre.message,
+                }
+            if not pre.ok and pre.severity == "warn":
+                self.debug_logger.log_phase(
+                    "precondition",
+                    status="warn",
+                    meta={"tool": tool_name, "reason": pre.message[:200]},
+                )
+
+        # ── Active failure-driven blacklist ─────────────────────────────
+        # Block exact (tool, args) combinations that already failed recently.
+        if not dry_run:
+            blocked = self._check_failure_blacklist(tool_name, args)
+            if blocked is not None:
+                self.debug_logger.log_phase(
+                    "failure_blacklist",
+                    status="block",
+                    meta={"tool": tool_name},
+                )
+                return blocked
+
+        # ── Circuit breaker (per-tool) ───────────────────────────────────
+        # Refuse to call a tool that has tripped the breaker until cool-down.
+        if not dry_run and getattr(self, "tool_retry_enabled", False):
+            breaker_open, breaker_reason = self._circuit_breaker.is_open(tool_name)
+            if breaker_open:
+                self.debug_logger.log_phase(
+                    "circuit_breaker",
+                    status="open",
+                    meta={"tool": tool_name, "reason": breaker_reason[:160]},
+                )
+                return {
+                    "status": "error",
+                    "message": breaker_reason,
+                    "data": None,
+                    "_meta": {"circuit_open": True, "tool": tool_name},
+                    "_correction_hint": (
+                        "This tool is in a bad state and is paused. "
+                        "Try a different approach or wait for cool-down."
+                    ),
+                }
+
         if not dry_run and tool_name in READ_ONLY_TOOLS and tool_name != "capture_pane":
             cached = self._get_cached_tool_result(tool_name, args)
             if cached is not None:
@@ -6020,18 +7113,51 @@ class AgentLoop:
             # FIX-2: Always use _hou_call — never raw thread calls
             is_read = tool_name in READ_ONLY_TOOLS
             hou_timeout_s = self._tool_hou_timeout(tool_name, is_read=is_read)
-            result = self._hou_call(
-                TOOL_FUNCTIONS[tool_name],
-                _timeout_s=hou_timeout_s,
-                **args,
-            )
-            sanitized = self._sanitize(result)
-            if not isinstance(sanitized, dict):
-                sanitized = {"status": "ok", "message": "OK", "data": sanitized}
+
+            # ── Retry loop for transient transport errors ───────────────
+            attempt = 0
+            attempts_used = 1
+            while True:
+                attempt += 1
+                result = self._hou_call(
+                    TOOL_FUNCTIONS[tool_name],
+                    _timeout_s=hou_timeout_s,
+                    **args,
+                )
+                sanitized = self._sanitize(result)
+                if not isinstance(sanitized, dict):
+                    sanitized = {"status": "ok", "message": "OK", "data": sanitized}
+                if not getattr(self, "tool_retry_enabled", False):
+                    attempts_used = attempt
+                    break
+                if not self._retry_policy.should_retry(attempt, sanitized, is_read_only=is_read):
+                    attempts_used = attempt
+                    break
+                delay = self._retry_policy.delay_for(attempt)
+                self.debug_logger.log_phase(
+                    "tool_retry",
+                    status="retry",
+                    meta={
+                        "tool": tool_name,
+                        "attempt": attempt,
+                        "delay_s": round(delay, 2),
+                        "err": str(sanitized.get("message", ""))[:120],
+                    },
+                )
+                time.sleep(delay)
             sanitized.setdefault("_meta", {})
             sanitized["_meta"]["dry_run"] = dry_run
             sanitized["_meta"]["safety"] = safety_level
             sanitized["_meta"]["duration_ms"] = int((time.time() - started) * 1000)
+            if attempts_used > 1:
+                sanitized["_meta"]["retry_attempts"] = attempts_used
+
+            # Update circuit breaker based on final outcome.
+            if getattr(self, "tool_retry_enabled", False):
+                if sanitized.get("status") == "ok":
+                    self._circuit_breaker.record_success(tool_name)
+                elif sanitized.get("status") == "error":
+                    self._circuit_breaker.record_failure(tool_name)
             if sanitized.get("status") == "error" and tool_name in {
                 "safe_set_parameter",
                 "set_parameter",
@@ -6064,6 +7190,35 @@ class AgentLoop:
                     self._mark_scene_dirty(tool_name)
                     self._tool_cache.clear()
 
+            # ── Fail-soft for OPTIONAL context tools ────────────────────
+            # If a non-essential read tool failed (often a timeout when
+            # Houdini's main thread is blocked), convert the error into a
+            # "skipped" status. The loop treats skipped as a no-op, so the
+            # agent stops retrying optional inspection and proceeds to the
+            # actual build work. Critical tools (create_node, set_parameter,
+            # connect_nodes, etc.) are NEVER softened — real failures still
+            # surface so the agent can self-correct.
+            if sanitized.get("status") == "error" and tool_name in OPTIONAL_CONTEXT_TOOLS:
+                _orig_msg = sanitized.get("message", "")[:200]
+                sanitized = {
+                    "status": "skipped",
+                    "message": (
+                        f"{tool_name} unavailable (skipped): {_orig_msg}. "
+                        "Proceeding without this optional context."
+                    ),
+                    "data": sanitized.get("data"),
+                    "_meta": {
+                        **(sanitized.get("_meta") or {}),
+                        "soft_skip": True,
+                        "original_error": _orig_msg,
+                    },
+                }
+                self.debug_logger.log_phase(
+                    "soft_skip",
+                    status="info",
+                    meta={"tool": tool_name, "reason": _orig_msg[:160]},
+                )
+
             # ── v11: Repair Critic evaluates errors ──
             if self._critic and sanitized.get("status") == "error":
                 verdict = self._critic.evaluate_tool_result(tool_name, args, sanitized)
@@ -6078,6 +7233,30 @@ class AgentLoop:
         except Exception as e:
             error_text = str(e)
             is_main_thread_timeout = self._is_houdini_main_thread_timeout(error_text)
+            # Fail-soft for OPTIONAL context tools: a timeout / exception in
+            # an inspection-only tool must never block the build path.
+            if tool_name in OPTIONAL_CONTEXT_TOOLS:
+                self.debug_logger.log_phase(
+                    "soft_skip",
+                    status="info",
+                    meta={"tool": tool_name, "reason": error_text[:160]},
+                )
+                return {
+                    "status": "skipped",
+                    "message": (
+                        f"{tool_name} unavailable (skipped): {error_text[:200]}. "
+                        "Proceeding without this optional context."
+                    ),
+                    "data": None,
+                    "_meta": {
+                        "dry_run": dry_run,
+                        "safety": safety_level,
+                        "duration_ms": int((time.time() - started) * 1000),
+                        "timed_out": bool(is_main_thread_timeout),
+                        "soft_skip": True,
+                        "original_error": error_text[:200],
+                    },
+                }
             return {
                 "status": "error",
                 "message": error_text,
@@ -6398,6 +7577,11 @@ class AgentLoop:
                 "rate limit",
                 "429",
                 "http 500",
+                # HARDENING: additional transient error patterns
+                "econnreset",
+                "broken pipe",
+                "incomplete chunked",
+                "read timed out",
             )
         )
 
@@ -6446,15 +7630,32 @@ class AgentLoop:
             summary = "[SCENE DIFF]\n- Applied write tools: " + ", ".join(
                 list(dict.fromkeys(write_tools))[:8]
             )
-        outputs = list(output_paths or [])
-        if outputs:
+        # Filter out HoudiniMind scratch namespaces — they confuse the user.
+        outputs = [p for p in (output_paths or []) if not self._is_scratch_path(p)]
+
+        # Surface verification FAIL state explicitly — without this, a build
+        # that hit round limit with verification problems was reported as
+        # "visible output is present" with no hint anything was wrong.
+        verification_report = self._last_turn_verification_report or {}
+        verification_text = self._last_turn_verification_text or ""
+        verification_failed = verification_report.get("status") == "fail"
+
+        if verification_failed:
+            prefix = "Scene edits were applied but verification FAILED. The build is not complete."
+        elif outputs:
             prefix = (
                 "Scene edits were applied and a visible output is present. "
                 f"Visible output: {', '.join(outputs[:4])}."
             )
         else:
             prefix = "Scene edits were applied before the agent hit its round limit."
-        return (prefix + ("\n\n" + summary if summary else "")).strip()
+
+        parts = [prefix]
+        if verification_failed and verification_text:
+            parts.append(verification_text)
+        if summary:
+            parts.append(summary)
+        return "\n\n".join(parts).strip()
 
     def _build_grounded_turn_response(
         self,
@@ -6624,13 +7825,37 @@ class AgentLoop:
         return outputs
 
     # ── Build retry helpers ───────────────────────────────────────────
+    def _fast_simple_build_incomplete(self, user_message: str) -> bool:
+        if not getattr(self, "_fast_message_mode", False):
+            return False
+        if not self._is_simple_direct_sop_edit_query(user_message):
+            return False
+        snapshot = self._capture_scene_snapshot()
+        if not snapshot:
+            return False
+
+        requested_types = self._requested_simple_sop_types(user_message)
+        node_types = {
+            str(node.get("type") or "").lower()
+            for node in (snapshot.get("nodes") or [])
+            if str(node.get("category") or "").lower() in {"sop", "surface", ""}
+        }
+        if requested_types and not requested_types.issubset(node_types):
+            return True
+
+        return bool(self._explicit_parameter_verification_issues(user_message, snapshot, []))
+
     def _should_retry_build_turn(
-        self, request_mode: str, response_text: str | None, dry_run: bool = False
+        self,
+        request_mode: str,
+        response_text: str | None,
+        dry_run: bool = False,
+        user_message: str = "",
     ) -> bool:
         if request_mode != "build" or not HOU_AVAILABLE or dry_run:
             return False
         if self._last_turn_write_tools:
-            return False
+            return self._fast_simple_build_incomplete(user_message)
         if not response_text:
             return False
         lower = response_text.lower()
@@ -6666,6 +7891,12 @@ class AgentLoop:
                 "429",
                 "please wait",
                 "rate limit",
+                # HARDENING: additional transient patterns
+                "http 500",
+                "econnreset",
+                "broken pipe",
+                "incomplete chunked",
+                "read timed out",
             )
         )
 
@@ -6740,22 +7971,25 @@ class AgentLoop:
         cache_key = self._tool_cache_key(tool_name, args)
         if not cache_key:
             return None
-        entry = self._tool_cache.get(cache_key)
-        if not entry:
-            # OPT-4: log cache miss
-            self.debug_logger.log_cache_event(tool_name, hit=False)
-            return None
-        if (time.time() - entry["ts"]) > CACHE_TTL[tool_name]:
-            self._tool_cache.pop(cache_key, None)
-            # OPT-4: expired = miss
-            self.debug_logger.log_cache_event(tool_name, hit=False, meta={"reason": "expired"})
-            return None
-        # OPT-4: log cache hit
-        self.debug_logger.log_cache_event(tool_name, hit=True)
-        try:
-            return json.loads(json.dumps(entry["result"]))
-        except Exception:
-            return entry["result"]
+        # HARDENING: read under lock — _on_scene_event can mutate _tool_cache
+        # from a Houdini callback thread at any time.
+        with self._tool_cache_lock:
+            entry = self._tool_cache.get(cache_key)
+            if not entry:
+                # OPT-4: log cache miss
+                self.debug_logger.log_cache_event(tool_name, hit=False)
+                return None
+            if (time.time() - entry["ts"]) > CACHE_TTL[tool_name]:
+                self._tool_cache.pop(cache_key, None)
+                # OPT-4: expired = miss
+                self.debug_logger.log_cache_event(tool_name, hit=False, meta={"reason": "expired"})
+                return None
+            # OPT-4: log cache hit
+            self.debug_logger.log_cache_event(tool_name, hit=True)
+            try:
+                return json.loads(json.dumps(entry["result"]))
+            except Exception:
+                return entry["result"]
 
     def _annotate_turn_valid_result(
         self, tool_name: str, result: dict, cached: bool = False
@@ -6893,7 +8127,7 @@ class AgentLoop:
                     e["request_tokens"] = set(tokens)
                 elif not isinstance(tokens, set):
                     e["request_tokens"] = set()
-            self._cross_turn_failures = entries[-15:]
+            self._cross_turn_failures = entries[-30:]  # HARDENING: raised cap from 15 to 30
         except Exception:
             pass
 
@@ -6908,15 +8142,18 @@ class AgentLoop:
 
             _os.makedirs(_os.path.dirname(path), exist_ok=True)
             payload = {
-                "_version": 1,
+                "_version": 2,
                 "entries": [
                     {
                         "tool": e.get("tool", ""),
                         "error": e.get("error", ""),
                         "request_tokens": sorted(e.get("request_tokens") or []),
                         "turn": int(e.get("turn", 0) or 0),
+                        # HARDENING v2: persist enriched failure context
+                        "failed_args": e.get("failed_args") or {},
+                        "successful_tools": e.get("successful_tools") or [],
                     }
-                    for e in self._cross_turn_failures[-15:]
+                    for e in self._cross_turn_failures[-30:]
                 ],
             }
             with open(path, "w", encoding="utf-8") as f:
@@ -6936,11 +8173,65 @@ class AgentLoop:
                     "error": entry.get("message", "unknown error")[:120],
                     "request_tokens": request_tokens,
                     "turn": self._turn_index,
+                    # HARDENING: store exact args that failed so we warn precisely
+                    "failed_args": {k: str(v)[:60] for k, v in (entry.get("args") or {}).items()},
+                    # HARDENING: store what DID work so far in this turn
+                    "successful_tools": list(dict.fromkeys(self._last_turn_write_tools or []))[:8],
                 }
             )
-        # Keep at most 15 entries — drop oldest
-        self._cross_turn_failures = self._cross_turn_failures[-15:]
+        # HARDENING: raised cap from 15 to 30 for long sessions
+        self._cross_turn_failures = self._cross_turn_failures[-30:]
         self._save_cross_turn_failures()
+
+    def _failure_args_fingerprint(self, args: dict) -> str:
+        """Stable fingerprint of args matching the format stored in failure memory."""
+        try:
+            truncated = {k: str(v)[:60] for k, v in (args or {}).items()}
+            return json.dumps(truncated, sort_keys=True, default=str)
+        except Exception:
+            return ""
+
+    def _check_failure_blacklist(self, tool_name: str, args: dict) -> dict | None:
+        """Return a blocking error dict if this exact (tool, args) recently failed.
+
+        Looks at the most recent ``failure_blacklist_window`` entries and matches
+        on (tool name AND identical truncated-args fingerprint). Read-only tools
+        are never blocked — re-reading after state changes is a legitimate move.
+        """
+        if not getattr(self, "failure_blacklist_enabled", False):
+            return None
+        if tool_name in READ_ONLY_TOOLS:
+            return None
+        recent = (self._cross_turn_failures or [])[-self.failure_blacklist_window :]
+        if not recent:
+            return None
+        fp = self._failure_args_fingerprint(args)
+        if not fp:
+            return None
+        for entry in reversed(recent):
+            if entry.get("tool") != tool_name:
+                continue
+            failed_args = entry.get("failed_args") or {}
+            try:
+                entry_fp = json.dumps(failed_args, sort_keys=True, default=str)
+            except Exception:
+                continue
+            if entry_fp == fp:
+                err = (entry.get("error") or "previous failure")[:160]
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Failure blacklist: identical {tool_name}({args}) "
+                        f"already failed earlier — {err}"
+                    ),
+                    "data": None,
+                    "_meta": {"failure_blocked": True, "previous_error": err},
+                    "_correction_hint": (
+                        "This exact tool+args combo failed before. "
+                        "Change at least one argument or pick a different tool."
+                    ),
+                }
+        return None
 
     def _build_cross_turn_failure_note(self, user_message: str, fast: bool = False) -> str:
         """
@@ -7035,12 +8326,197 @@ class AgentLoop:
                 break
         if not found:
             return ""
-        lines = ["[FAST SCHEMA HINT] Known parameters for referenced node types:"]
+        lines = ["[SCHEMA HINT] Known parameters for referenced node types:"]
         for name, info in found.items():
             parm_str = ", ".join(info["parms"][:15]) if info["parms"] else "—"
             lines.append(f"  {info['ctx']}/{name} ({info['ui_name']}): {parm_str}")
         lines.append("Use exact parameter names above — do not guess or invent parm names.")
         return "\n".join(lines)
+
+    def _get_rag20_live_hints(self, user_message: str, limit: int = 3) -> list[dict]:
+        try:
+            from houdinimind.rag.rag20 import Rag20ContextInjector
+
+            injector = Rag20ContextInjector(
+                asset_dir=self.config.get("rag20_asset_dir") or self.config.get("rag2_asset_dir"),
+                max_context_tokens=self.config.get("rag_max_context_tokens", 3000),
+                top_k=max(1, int(limit or 1)),
+                model_name=self.config.get("model", ""),
+            )
+            return injector.live_node_hints(user_message, limit=limit)
+        except Exception:
+            return []
+
+    def _build_rag20_live_schema_hint(self, user_message: str) -> str:
+        try:
+            from houdinimind.rag.rag20 import Rag20ContextInjector
+
+            injector = Rag20ContextInjector(
+                asset_dir=self.config.get("rag20_asset_dir") or self.config.get("rag2_asset_dir"),
+                max_context_tokens=self.config.get("rag_max_context_tokens", 3000),
+                top_k=3,
+                model_name=self.config.get("model", ""),
+            )
+            return injector.live_hint_message(user_message, limit=3, max_parameters=24)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_numeric_target_near_label(user_message: str, label: str, parm_name: str):
+        text = str(user_message or "")
+        names = [str(label or "").strip(), str(parm_name or "").strip()]
+        names = [name for name in names if name]
+        for name in sorted(set(names), key=len, reverse=True):
+            flexible_name = re.escape(name).replace(r"\ ", r"\s+")
+            pattern = re.compile(
+                rf"\b{flexible_name}\b[\s\S]{{0,80}}?\b(?:to|=|at|as)\s*"
+                r"(-?\d+(?:\.\d+)?)",
+                re.IGNORECASE,
+            )
+            match = pattern.search(text)
+            if match:
+                return float(match.group(1))
+        generic = re.search(
+            r"\bset\b[\s\S]{0,120}?\b(?:to|=|at|as)\s*(-?\d+(?:\.\d+)?)",
+            text,
+            re.IGNORECASE,
+        )
+        return float(generic.group(1)) if generic else None
+
+    def _explicit_parameter_targets_from_rag20(self, user_message: str) -> list[dict]:
+        if not re.search(r"\b(set|change|adjust|make)\b", user_message or "", re.IGNORECASE):
+            return []
+        targets: list[dict] = []
+        text = str(user_message or "")
+        text_l = text.lower()
+
+        def _contains_phrase(phrase: str) -> bool:
+            words = re.findall(r"[a-z0-9]+", str(phrase or "").lower())
+            if not words:
+                return False
+            pattern = r"\b" + r"\s+".join(re.escape(word) for word in words) + r"\b"
+            return bool(re.search(pattern, text_l, re.IGNORECASE))
+
+        for hint in self._get_rag20_live_hints(user_message, limit=3):
+            node_type = str(hint.get("internal_name") or "").strip()
+            params = hint.get("parameters") if isinstance(hint.get("parameters"), dict) else {}
+            for parm_name, meta in params.items():
+                if not isinstance(meta, dict):
+                    continue
+                label = str(meta.get("label") or parm_name)
+                parm = str(parm_name)
+                parm_l = parm.lower()
+                if parm_l == "rad" and "uniform scale" in text_l:
+                    continue
+                matched_label = _contains_phrase(label)
+                # Single-letter tuple bases like t/r are internal shorthand and
+                # must not match incidental letters inside words like "that's"
+                # or "radius". Only accept them through their explicit label.
+                matched_parm = len(parm_l) > 1 and _contains_phrase(parm_l)
+                if not matched_label and not matched_parm:
+                    continue
+                value = self._extract_numeric_target_near_label(user_message, label, parm)
+                if value is None:
+                    continue
+                targets.append(
+                    {
+                        "node_type": node_type,
+                        "parm_name": parm,
+                        "label": label,
+                        "value": value,
+                    }
+                )
+        unique: list[dict] = []
+        seen = set()
+        for target in targets:
+            key = (target["node_type"].lower(), target["parm_name"].lower(), target["value"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(target)
+        return unique[:6]
+
+    @staticmethod
+    def _snapshot_parameter_value(node: dict, parm_name: str):
+        params = node.get("parameters") or {}
+        if not isinstance(params, dict):
+            return None
+        raw = params.get(parm_name)
+        if isinstance(raw, dict):
+            return raw.get("v", raw.get("value"))
+        return raw
+
+    def _explicit_parameter_verification_issues(
+        self,
+        user_message: str,
+        after_snapshot: dict | None,
+        parent_paths: list[str],
+        stream_callback=None,
+    ) -> list[dict]:
+        if not after_snapshot:
+            return []
+        targets = self._explicit_parameter_targets_from_rag20(user_message)
+        if not targets:
+            return []
+        nodes = after_snapshot.get("nodes", []) or []
+        issues: list[dict] = []
+        for target in targets:
+            node_type = str(target.get("node_type") or "").lower()
+            parm_name = str(target.get("parm_name") or "")
+            expected = float(target.get("value"))
+            candidates = [
+                node
+                for node in nodes
+                if str(node.get("type", "") or "").lower() == node_type
+                and (
+                    not parent_paths
+                    or any(
+                        self._path_under_parent(str(node.get("path") or ""), p)
+                        for p in parent_paths
+                    )
+                )
+            ]
+            if not candidates:
+                continue
+            satisfied = False
+            inspected_any = False
+            for node in candidates[:4]:
+                actual = self._snapshot_parameter_value(node, parm_name)
+                if actual is None and "get_node_parameters" in TOOL_FUNCTIONS:
+                    probe = self._run_observation_tool(
+                        "get_node_parameters",
+                        {"node_path": node.get("path"), "compact": False},
+                        stream_callback,
+                    )
+                    if probe.get("status") == "ok":
+                        params = (probe.get("data") or {}).get("parameters") or {}
+                        raw = params.get(parm_name)
+                        actual = raw.get("v", raw.get("value")) if isinstance(raw, dict) else raw
+                if actual is None:
+                    continue
+                inspected_any = True
+                try:
+                    if abs(float(actual) - expected) <= 1e-4:
+                        satisfied = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not satisfied:
+                path = str((candidates[0] or {}).get("path") or (parent_paths or ["/obj"])[0])
+                label = target.get("label") or parm_name
+                detail = (
+                    "was not inspected" if not inspected_any else f"does not equal {expected:g}"
+                )
+                issues.append(
+                    {
+                        "severity": "repair",
+                        "path": path,
+                        "message": (
+                            f"Requested parameter '{label}' must use internal parm '{parm_name}' "
+                            f"on {node_type}; current value {detail}. Set it to {expected:g}."
+                        ),
+                    }
+                )
+        return issues
 
     def _finalize_turn_tracking(
         self,
@@ -7051,8 +8527,18 @@ class AgentLoop:
     ) -> None:
         self._last_turn_tool_counts = dict(self._turn_tool_counts)
         self._last_turn_tool_history = list(tool_history)
-        self._last_turn_write_tools = list(write_tools)
-        self._last_turn_mutation_summaries = list(mutation_summaries or [])
+
+        # If we are in a recursive call (depth > 0), accumulate tools/summaries
+        # instead of overwriting them, so the parent turn's edits are not lost.
+        current_depth = getattr(self, "_current_loop_depth", 0)
+        if current_depth == 0:
+            self._last_turn_write_tools = list(write_tools)
+            self._last_turn_mutation_summaries = list(mutation_summaries or [])
+        else:
+            combined_write_tools = self._last_turn_write_tools + write_tools
+            self._last_turn_write_tools = list(dict.fromkeys(combined_write_tools))
+            self._last_turn_mutation_summaries.extend(mutation_summaries or [])
+
         self._last_turn_dry_run = dry_run
         self._last_turn_checkpoint_path = self._current_turn_checkpoint_path
 
@@ -7080,6 +8566,10 @@ class AgentLoop:
                 scale=0.75,
             )
             if res.get("status") != "ok":
+                _reason = res.get("message", "unknown error")
+                self.debug_logger.log_system_note(
+                    f"[VISION] {label} capture failed (status={res.get('status')}): {_reason}"
+                )
                 if pane_type == "network":
                     self._turn_network_capture_failed = True
                 return None
@@ -7087,11 +8577,16 @@ class AgentLoop:
             if image_b64:
                 self.debug_logger.log_screenshot(label, image_b64=image_b64)
                 self._turn_capture_cache[cache_key] = image_b64
+            else:
+                self.debug_logger.log_system_note(
+                    f"[VISION] {label} capture returned ok but image_b64 is empty. "
+                    "Viewport may be behind another pane or not visible."
+                )
             return image_b64
         except Exception as e:
             if pane_type == "network":
                 self._turn_network_capture_failed = True
-            self.debug_logger.log_system_note(f"{label} capture failed: {e}")
+            self.debug_logger.log_system_note(f"[VISION] {label} capture exception: {e}")
             return None
 
     def _enrich_capture_result(
@@ -7186,14 +8681,6 @@ class AgentLoop:
         if not HOU_AVAILABLE:
             return True
 
-        # Allow one extra capture for the visual self-check on top of the
-        # normal per-turn budget. Use self.max_capture_pane_per_turn (already
-        # resolved from config at init) so this stays consistent with the
-        # gate in _execute_tool — reading config.get() separately let the
-        # two limits drift out of sync.
-        if self._turn_capture_pane_analyses >= self.max_capture_pane_per_turn + 1:
-            return True
-
         image_b64 = image_b64 or self._capture_debug_screenshot(
             "Visual Self-Check",
             force_refresh=True,
@@ -7257,6 +8744,112 @@ class AgentLoop:
         if stream_callback:
             stream_callback("\u200b👁️ Visual self-check passed.\n\n")
         return True
+
+    # ── Cognitive memory / workflow state ────────────────────────────
+    def _build_cognitive_memory_guidance(self, user_message: str, request_mode: str) -> str:
+        if not bool(self.config.get("cognitive_memory_enabled", True)):
+            return ""
+        if not self.memory or not hasattr(self.memory, "retrieve_agent_context"):
+            return ""
+        if request_mode not in {"build", "debug", "research", "advice"}:
+            return ""
+        try:
+            return self.memory.retrieve_agent_context(
+                user_message,
+                embed_fn=getattr(self.llm, "embed", None),
+                limit=max(2, int(self.config.get("cognitive_memory_top_k", 8))),
+                max_chars=max(800, int(self.config.get("cognitive_memory_max_chars", 2600))),
+            )
+        except Exception as e:
+            self.debug_logger.log_system_note(f"Cognitive memory retrieval skipped: {e}")
+            return ""
+
+    def _remember_turn_outcome(
+        self,
+        *,
+        user_message: str,
+        response_text: str,
+        request_mode: str,
+        scene_diff_text: str = "",
+    ) -> None:
+        if not bool(self.config.get("cognitive_memory_enabled", True)):
+            return
+        if not self.memory or not hasattr(self.memory, "remember_turn_outcome"):
+            return
+        try:
+            self.memory.remember_turn_outcome(
+                user_message=user_message,
+                agent_response=response_text,
+                request_mode=request_mode,
+                verification_report=getattr(self, "_last_turn_verification_report", None),
+                tool_history=getattr(self, "_last_turn_tool_history", []),
+                write_tools=getattr(self, "_last_turn_write_tools", []),
+                scene_diff=scene_diff_text,
+                embed_fn=getattr(self.llm, "embed", None),
+            )
+        except Exception as e:
+            self.debug_logger.log_system_note(f"Turn reflection memory skipped: {e}")
+
+    def _start_workflow_run(self, user_message: str, request_mode: str) -> None:
+        store = getattr(self, "workflow_state", None)
+        if store is None:
+            return
+        try:
+            self._current_workflow_run_id = store.start_run(
+                user_goal=user_message,
+                request_mode=request_mode,
+                checkpoint_path=getattr(self, "_current_turn_checkpoint_path", "") or "",
+            )
+            self.debug_logger.log_phase(
+                "workflow_state",
+                status="started",
+                meta={"run_id": self._current_workflow_run_id, "mode": request_mode},
+            )
+        except Exception as e:
+            self._current_workflow_run_id = None
+            self.debug_logger.log_system_note(f"Workflow state start skipped: {e}")
+
+    def _record_workflow_event(self, event_type: str, payload: dict) -> None:
+        run_id = getattr(self, "_current_workflow_run_id", None)
+        store = getattr(self, "workflow_state", None)
+        if not run_id or store is None:
+            return
+        try:
+            store.append_event(run_id, event_type, payload)
+        except Exception as e:
+            self.debug_logger.log_system_note(f"Workflow event '{event_type}' skipped: {e}")
+
+    def _update_workflow_plan(self, plan_data: dict | None) -> None:
+        run_id = getattr(self, "_current_workflow_run_id", None)
+        store = getattr(self, "workflow_state", None)
+        if not run_id or store is None or not plan_data:
+            return
+        try:
+            store.update_plan(run_id, plan_data)
+        except Exception as e:
+            self.debug_logger.log_system_note(f"Workflow plan update skipped: {e}")
+
+    def _finish_workflow_run(self, response_text: str, *, success: bool = True) -> None:
+        run_id = getattr(self, "_current_workflow_run_id", None)
+        store = getattr(self, "workflow_state", None)
+        if not run_id or store is None:
+            return
+        report = getattr(self, "_last_turn_verification_report", None) or {}
+        status = "completed" if success else "failed"
+        if report.get("status") == "fail":
+            status = "partial"
+        elif report.get("status") == "pass":
+            status = "completed"
+        elif getattr(self, "_last_turn_write_tools", None) and success:
+            status = "partial"
+        try:
+            store.finish_run(
+                run_id,
+                status=status,
+                summary=(response_text or "")[:2000],
+            )
+        except Exception as e:
+            self.debug_logger.log_system_note(f"Workflow finish skipped: {e}")
 
     # ── Logging helpers ───────────────────────────────────────────────
     def _start_logged_interaction(self, user_message: str, domain: str | None = None) -> int:
@@ -7324,7 +8917,7 @@ class AgentLoop:
             self.reload_system_prompt()
 
     def reload_knowledge(self):
-        if not self.rag:
+        if not self.rag and not self._ensure_rag_loaded():
             return
         try:
             if hasattr(self.rag, "retriever") and hasattr(self.rag.retriever, "reload"):
@@ -7409,12 +9002,33 @@ class AgentLoop:
             return None
         if not self._last_turn_write_tools:
             return None
+
+        # HARDENING: Only auto-restore on severe failures. If the geometry
+        # exists but has minor issues, keep the work rather than wiping it.
+        issues = report.get("issues", [])
+        severe_issues = [i for i in issues if i.get("severity") in {"repair", "error"}]
+        if not severe_issues:
+            minor_msg = (
+                "Verification found minor issues but the geometry is intact. "
+                "You may want to review and adjust manually."
+            )
+            self.debug_logger.log_system_note(
+                f"[AUTO-RESTORE] Skipped — only minor issues: {len(issues)} total, 0 severe"
+            )
+            if stream_callback:
+                stream_callback(
+                    "\u200b\u2705 Minor verification issues detected but geometry is preserved.\n\n"
+                )
+            return minor_msg
+
         if not self.has_restorable_checkpoint():
             return "Verification still failed and no checkpoint is available for rollback."
 
         restore_msg = self.restore_last_turn_checkpoint()
         if stream_callback:
-            stream_callback("\u200b↩️ Verification remained failed; restoring turn checkpoint.\n\n")
+            stream_callback(
+                "\u200b\u21a9\ufe0f Verification remained failed; restoring turn checkpoint.\n\n"
+            )
         if "failed" in str(restore_msg).lower():
             return "Verification still failed after repairs, and automatic rollback failed: " + str(
                 restore_msg

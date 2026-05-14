@@ -67,7 +67,6 @@ from ._chain_tools import (
     add_spare_parameters,
     add_sticky_note,
     auto_connect_chain,
-    create_bed_controls,
     create_network_box,
     create_node_chain,
     create_subnet,
@@ -188,11 +187,6 @@ from ._simulation_tools import (
     get_flip_diagnostic,
     get_sim_stats,
     get_simulation_diagnostic,
-    setup_flip_fluid,
-    setup_pyro_sim,
-    setup_rbd_fracture,
-    setup_vellum_cloth,
-    setup_vellum_pillow,
 )
 from ._vision_tools import (
     capture_pane,
@@ -277,16 +271,10 @@ TOOL_FUNCTIONS = {
     "set_frame_range": set_frame_range,
     "go_to_frame": go_to_frame,
     "layout_network": layout_network,
-    "create_bed_controls": create_bed_controls,
     "add_sticky_note": add_sticky_note,
-    "setup_vellum_cloth": setup_vellum_cloth,
-    "setup_vellum_pillow": setup_vellum_pillow,
-    "setup_flip_fluid": setup_flip_fluid,
     "get_dop_objects": get_dop_objects,
     "bake_simulation": bake_simulation,
     "get_sim_stats": get_sim_stats,
-    "setup_pyro_sim": setup_pyro_sim,
-    "setup_rbd_fracture": setup_rbd_fracture,
     "get_simulation_diagnostic": get_simulation_diagnostic,
     "get_flip_diagnostic": get_flip_diagnostic,
     "get_stacking_offset": get_stacking_offset,
@@ -361,18 +349,62 @@ TOOL_FUNCTIONS = {
 
 DESTRUCTIVE_TOOLS = {"delete_node", "disconnect_node"}
 CONFIRM_TOOLS = {
+    # Direct destructive
     "delete_node",
     "disconnect_node",
-    "find_and_replace_parameter",
-    "convert_to_hda",
+    # File-system writes
+    "save_hip",
+    "create_backup",
+    "restore_backup",
     "export_geometry",
+    "bake_simulation",
+    "submit_render",
+    "submit_pdg_cook",
+    # HDA / asset mutation
+    "convert_to_hda",
+    "convert_network_to_hda",
+    "create_hda_with_parameters",
+    "reload_hda_definition",
+    "add_hda_parameters",
+    "promote_parameter",
+    "find_and_replace_parameter",
     "remap_file_paths",
-    "eval_hscript",
+    # Code-emitting writes
     "write_python_script",
+    "write_vex_code",
+    "write_vop_network",
+    "set_expression",
+    "set_expression_from_description",
+    "eval_hscript",
+    "setup_fabric_lookdev",
+    # Long-cook writes
+    "cook_network_range",
+    "create_file_cache_top",
 }
 DANGEROUS_TOOLS = {"execute_python"}
 TOOL_SAFETY_TIERS = {tool: "confirm" for tool in CONFIRM_TOOLS}
 TOOL_SAFETY_TIERS.update({tool: "dangerous" for tool in DANGEROUS_TOOLS})
+
+# Tools that are pure Python — they don't call hou.* and don't need to run on
+# Houdini's main thread. Letting the MCP server execute them directly in its
+# worker pool keeps RAG/docs/knowledge lookups responsive even when Houdini is
+# busy cooking. Anything not in this set is dispatched via hdefereval so it
+# runs on the main thread (the safe default).
+OFF_MAIN_THREAD_TOOLS = {
+    "search_knowledge",
+    "search_docs",
+    "get_vex_snippet",
+    "validate_vex",
+    "explain_node_type",
+    "get_error_fix",
+    "get_node_recipe",
+    "suggest_workflow",
+    "list_node_types",
+    "resolve_build_hints",
+    "validate_fx_workflow_matrix",
+    "get_flip_diagnostic",
+    "get_simulation_diagnostic",
+}
 BACKUP_BEFORE_TOOLS = {
     "delete_node",
     "disconnect_node",
@@ -385,7 +417,6 @@ BACKUP_BEFORE_TOOLS = {
     "write_python_script",
     "execute_python",
     "create_node_chain",
-    "setup_vellum_cloth",
     "create_material",
     "assign_material",
     "convert_to_hda",
@@ -531,7 +562,10 @@ TOOL_SCHEMAS = [
             "description": "Read all parameter values for a node.",
             "parameters": {
                 "type": "object",
-                "properties": {"node_path": {"type": "string"}},
+                "properties": {
+                    "node_path": {"type": "string"},
+                    "compact": {"type": "boolean", "default": True},
+                },
                 "required": ["node_path"],
             },
         },
@@ -543,7 +577,11 @@ TOOL_SCHEMAS = [
             "description": "Check input connections and red-arrow errors.",
             "parameters": {
                 "type": "object",
-                "properties": {"node_path": {"type": "string"}},
+                "properties": {
+                    "node_path": {"type": "string"},
+                    "only_connected": {"type": "boolean", "default": True},
+                    "max_inputs": {"type": "integer", "default": 64},
+                },
                 "required": ["node_path"],
             },
         },
@@ -555,7 +593,10 @@ TOOL_SCHEMAS = [
             "description": "Read detail/point/prim attributes from a SOP node.",
             "parameters": {
                 "type": "object",
-                "properties": {"node_path": {"type": "string"}},
+                "properties": {
+                    "node_path": {"type": "string"},
+                    "max_attribs": {"type": "integer", "default": 50},
+                },
                 "required": ["node_path"],
             },
         },
@@ -681,7 +722,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "create_node_chain",
-            "description": "Create and wire a sequence of nodes in ONE call. Pass a chain list with type, name, parms dict, optional inputs array (names of nodes in chain to wire into this node), and optional vex string per step. Primitive generators (box, sphere, etc) do NOT auto-wire. Merge nodes AUTO-GATHER all unwired nodes in the chain.",
+            "description": "Create and wire a sequence of nodes in ONE call. Pass a chain list with type, name, parms dict, optional inputs array (names of nodes in chain to wire into this node), and optional vex string per step. VEX snippets are compile-validated before being kept. Primitive generators (box, sphere, etc) do NOT auto-wire. Merge nodes AUTO-GATHER all unwired nodes in the chain. WARNING: DO NOT GUESS PARAMETER NAMES in the parms dict. You MUST use search_knowledge to look up exact parameter names first, per the RAG-FIRST protocol.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -700,7 +741,13 @@ TOOL_SCHEMAS = [
                                     "items": {"type": "string"},
                                 },
                             },
+                            "required": ["type", "name"],
                         },
+                    },
+                    "cleanup_on_error": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "If true, remove all nodes created by this call when any step fails.",
                     },
                 },
                 "required": ["parent_path", "chain"],
@@ -821,6 +868,7 @@ TOOL_SCHEMAS = [
                     "parent_path": {"type": "string"},
                     "node_type": {"type": "string"},
                     "name": {"type": "string"},
+                    "cook": {"type": "boolean", "default": True},
                 },
                 "required": ["parent_path", "node_type"],
             },
@@ -853,7 +901,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "safe_set_parameter",
-            "description": "Safely set a parameter value with alias handling and vector-component expansion (for example size -> sizex/y/z). Prefer this over raw parameter writes when the name may be fuzzy.",
+            "description": "Safely set a parameter value with alias handling and vector-component expansion. WARNING: DO NOT GUESS PARAMETER NAMES. You MUST use search_knowledge to query live parm names first per the RAG-FIRST protocol. For wrangle VEX, prefer write_vex_code(); snippet/vex_code writes through this tool are validated and rejected on compile errors.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -869,7 +917,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "set_parameter",
-            "description": "Set a parameter to a literal value. Ensure the parameter name is precisely matched.",
+            "description": "Set a parameter to a literal value. WARNING: DO NOT GUESS PARAMETER NAMES. You MUST use search_knowledge or get_node_parameters to query exact parameter names first.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1031,7 +1079,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "execute_python",
-            "description": "Execute Python code in the Houdini session. Use only when the user explicitly wants Python code run.",
+            "description": "Execute Python code in the Houdini session. Use only when the user explicitly wants Python code run. Direct writes to wrangle snippet parms are blocked; use write_vex_code for VEX.",
             "parameters": {
                 "type": "object",
                 "properties": {"code": {"type": "string"}},
@@ -1259,6 +1307,11 @@ TOOL_SCHEMAS = [
                         "description": "If true (default), automatically discovers, promotes, and links meaningful parameters from the internal nodes.",
                         "default": True,
                     },
+                    "extra_parameters": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Optional additional HDA parameter descriptors to add beyond auto-discovered parameters.",
+                    },
                 },
                 "required": ["parent_path", "node_names", "hda_name"],
             },
@@ -1401,7 +1454,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_knowledge",
-            "description": "Search the HoudiniMind knowledge base strictly for SPECIFIC TECHNICAL DETAILS (node parameters, internal names, VEX functions, and error fixes). DO NOT query for high-level project workflows, tutorials, or step-by-step guides (e.g. do NOT ask 'how to build a bed'). Use this when you need technical reference for a specific node type.",
+            "description": "Search the HoudiniMind knowledge base. MUST BE CALLED FIRST before creating nodes, setting parameters, or writing VEX to verify internal node types, exact parameter names, and VEX syntax. This is the mandatory RAG-FIRST protocol to prevent 'Invalid parameter name' and 'Syntax error' failures.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1596,21 +1649,6 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "create_bed_controls",
-            "description": "Create a control null with master parameters (Width, Length, Mattress Height) for procedural bedding. ALWAYS use this at the start of a bed build.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "parent_path": {"type": "string"},
-                    "name": {"type": "string", "default": "BED_CONTROLS"},
-                },
-                "required": ["parent_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "add_sticky_note",
             "description": "Add an annotating sticky note to a network.",
             "parameters": {
@@ -1729,31 +1767,56 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "setup_flip_fluid",
-            "description": "Create a complete FLIP fluid simulation rig in one call: source → dopnet(flipsolver) → particlefluidsurface. The bread-and-butter FX TD setup.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "parent_path": {"type": "string"},
-                    "geo_node_path": {"type": "string"},
-                    "container_size": {"type": "array", "items": {"type": "number"}},
-                    "particle_separation": {"type": "number", "default": 0.1},
-                    "gravity": {"type": "number", "default": -9.8},
-                    "cache_dir": {"type": "string", "default": "$HIP/cache/flip"},
-                },
-                "required": ["parent_path", "geo_node_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "get_flip_diagnostic",
             "description": "Analyse a FLIP simulation for particle count, velocity range, substeps, and NaN detection.",
             "parameters": {
                 "type": "object",
                 "properties": {"dopnet_path": {"type": "string"}},
                 "required": ["dopnet_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_fx_workflow_matrix",
+            "description": (
+                "Build and validate a live low-resolution matrix for expert FX coverage: "
+                "FLIP, Vellum cloth, Vellum pillow, RBD, Pyro, POP, grains, wire, "
+                "and cache/export workflows. Checks node creation, wiring, node errors, "
+                "cache TOP setup, export output, and optional short frame cooks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "parent_path": {"type": "string", "default": "/obj"},
+                    "workflows": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "flip",
+                                "vellum_cloth",
+                                "vellum_pillow",
+                                "rbd",
+                                "pyro",
+                                "pop",
+                                "grains",
+                                "wire",
+                                "cache_export",
+                            ],
+                        },
+                    },
+                    "cook_frames": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Optional number of frames to force-cook per workflow.",
+                    },
+                    "cache_dir": {
+                        "type": "string",
+                        "default": "$HIP/cache/houdinimind_validation",
+                    },
+                },
             },
         },
     },
@@ -1844,7 +1907,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "batch_set_parameters",
-            "description": "Bulk-set parameters on multiple nodes. Input: list of {node_path, parm_name, value}.",
+            "description": "Bulk-set parameters on multiple nodes. Input: list of {node_path, parm_name, value}. WARNING: DO NOT GUESS PARAMETER NAMES. You MUST use search_knowledge to query exact parameter names first.",
             "parameters": {
                 "type": "object",
                 "properties": {"nodes_and_parms": {"type": "array", "items": {"type": "object"}}},
@@ -2066,6 +2129,7 @@ TOOL_SCHEMAS = [
                     "start_frame": {"type": "integer"},
                     "end_frame": {"type": "integer"},
                     "node_path": {"type": "string"},
+                    "max_total_seconds": {"type": "number", "default": 120.0},
                 },
                 "required": ["parent_path", "start_frame", "end_frame"],
             },
@@ -2417,7 +2481,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_stacking_offset",
-            "description": "Universal spatial alignment tool: calculates the exact Y-offset needed to stack one node perfectly on top of another using bounding box geometry. Use this for ALL multi-part builds (tables, props, rigs).",
+            "description": "Universal spatial alignment tool: calculates the exact Y-offset needed to stack one node perfectly on top of another using bounding box geometry. Use this for multi-part builds that need physically plausible support or stacking.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2469,7 +2533,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "set_viewport_display_mode",
-            "description": "Change the viewport shading mode: smooth, wire, wireghost, flat, hidden_invis, or points.",
+            "description": "Change the viewport shading mode: smooth/shaded, wire/wireframe, wireghost, flat, hidden_invis, or points.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2477,7 +2541,9 @@ TOOL_SCHEMAS = [
                         "type": "string",
                         "enum": [
                             "smooth",
+                            "shaded",
                             "wire",
+                            "wireframe",
                             "wireghost",
                             "flat",
                             "hidden_invis",
@@ -2770,4 +2836,5 @@ core._tool_meta_registry = {
     "DANGEROUS_TOOLS": DANGEROUS_TOOLS,
     "TOOL_SAFETY_TIERS": TOOL_SAFETY_TIERS,
     "BACKUP_BEFORE_TOOLS": BACKUP_BEFORE_TOOLS,
+    "OFF_MAIN_THREAD_TOOLS": OFF_MAIN_THREAD_TOOLS,
 }

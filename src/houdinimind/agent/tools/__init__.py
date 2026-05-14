@@ -36,12 +36,25 @@ from ._registry import (
     CONFIRM_TOOLS,
     DANGEROUS_TOOLS,
     DESTRUCTIVE_TOOLS,
+    OFF_MAIN_THREAD_TOOLS,
     TOOL_SAFETY_TIERS,
     TOOL_SCHEMAS,
 )
 from ._registry import (
     TOOL_FUNCTIONS as _RAW_TOOL_FUNCTIONS,
 )
+
+__all__ = [
+    "BACKUP_BEFORE_TOOLS",
+    "CONFIRM_TOOLS",
+    "DANGEROUS_TOOLS",
+    "DESTRUCTIVE_TOOLS",
+    "OFF_MAIN_THREAD_TOOLS",
+    "TOOL_FUNCTIONS",
+    "TOOL_SAFETY_TIERS",
+    "TOOL_SCHEMAS",
+    "apply_scope_filter",
+]
 
 HOUDINIMIND_ROOT = _core.HOUDINIMIND_ROOT
 SCHEMA_PATH = _core.SCHEMA_PATH
@@ -224,6 +237,19 @@ TOOL_FUNCTIONS = {
 
 for _tool_name, _tool_fn in TOOL_FUNCTIONS.items():
     globals()[_tool_name] = _tool_fn
+
+for _compat_name in (
+    "setup_flip_fluid",
+    "setup_pop_sim",
+    "setup_pyro_sim",
+    "setup_rbd_fracture",
+    "setup_vellum_cloth",
+    "setup_vellum_pillow",
+    "validate_fx_workflow_matrix",
+):
+    _compat_fn = getattr(_simulation_tools, _compat_name, None)
+    if callable(_compat_fn):
+        globals()[_compat_name] = _wrap_callable(_compat_fn)
 
 
 def apply_scope_filter(config: dict):

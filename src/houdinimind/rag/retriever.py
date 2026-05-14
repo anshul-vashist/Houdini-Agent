@@ -15,6 +15,7 @@ New in v2:
 """
 
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -70,6 +71,8 @@ QUERY_EXPANSIONS: dict[str, list[str]] = {
     # VEX / Code
     "vex": ["wrangle", "snippet", "attribwrangle", "code"],
     "script": ["vex", "python", "wrangle", "expression"],
+    "hom": ["python", "hou", "houdini python"],
+    "hou": ["python", "hom", "houdini python"],
     "noise": ["perlin", "curl", "voronoi", "wnoise", "vnoise"],
     "texture": ["uv", "map", "image", "sample"],
     # Rendering
@@ -99,6 +102,7 @@ LOW_WEIGHT_QUERY_SYNONYMS: dict[str, list[str]] = {
 }
 
 NODE_TITLE_PREFIXES = (
+    "node:",
     "sop node:",
     "dop node:",
     "lop node:",
@@ -255,6 +259,10 @@ ASSET_BUILD_HINTS = (
     "prop",
     "furniture",
 )
+ASSET_OBJECT_HINTS = tuple(
+    term for term in ASSET_BUILD_HINTS if term not in {"create", "build", "make", "model"}
+)
+BUILD_ACTION_HINTS = ("create", "build", "make", "model", "add", "generate")
 
 NODE_LOOKUP_HINTS = (
     "node",
@@ -272,7 +280,16 @@ NODE_LOOKUP_HINTS = (
 
 SOP_LOOKUP_HINTS = (
     "sop",
+    "tube",
+    "cylinder",
     "poly",
+    "polyextrude",
+    "poly extrude",
+    "extrude",
+    "columns",
+    "rows",
+    "primitive",
+    "primitives",
     "boolean",
     "blast",
     "group",
@@ -318,6 +335,12 @@ def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in lowered for phrase in phrases)
 
 
+def _contains_any_token(text: str, tokens: tuple[str, ...]) -> bool:
+    """Word-boundary-aware match. Prevents 'script' matching 'hscript', etc."""
+    lowered = text.lower()
+    return any(re.search(r"\b" + re.escape(tok) + r"\b", lowered) for tok in tokens)
+
+
 def _entry_shard_name(entry: dict) -> str:
     title = str(entry.get("title", "") or "")
     category = str(entry.get("category", "") or "").lower()
@@ -335,8 +358,21 @@ def _entry_shard_name(entry: dict) -> str:
                 return shard_name
         return "sop_nodes"
 
+    # Bug fix: sop_node_docs.json entries are filed as category="general" but
+    # contain SOP node reference docs — they belong in sop_nodes for correct
+    # routing and scoring. Detect by source name or title prefix.
+    _src_name = str(entry.get("_source", "") or entry.get("source", "")).lower()
+    _src_path = os.path.basename(str(entry.get("_source_path", "") or "")).lower()
+    if "sop_node_docs" in _src_name or "sop_node_docs" in _src_path:
+        return "sop_nodes"
+    if "sop node:" in title.lower():
+        return "sop_nodes"
+
     if category == "vex" or "vex function:" in title.lower() or "vex attribute:" in title.lower():
         return "vex_reference"
+
+    if category == "python" or source == "houdini_python_functions_json":
+        return "python_examples"
 
     if category == "errors" or "troubleshooting" in text:
         return "troubleshooting"
@@ -379,15 +415,45 @@ def _route_query_shards(query: str) -> list[str]:
     def boost(shard_name: str, amount: float):
         scores[shard_name] = scores.get(shard_name, 0.0) + amount
 
+    # Bug fix: hscript must be handled before generic keyword loop.
+    # Without this guard the "script" token produced by BM25 CamelCase-splitting
+    # "HScript" (→ "h script") matches QUERY_EXPANSIONS["script"] → ["python", ...]
+    # and downstream example-intent detection, both of which push python_examples
+    # above the correct general_reference shard.
+    _is_hscript_query = "hscript" in text
+    if _is_hscript_query:
+        boost("general_reference", 12.0)  # strong enough to beat any python boost
+
+    # Bug fix: troubleshooting must always be searched when the query contains
+    # error/debug signals even if a VEX symbol is also present. Previously the
+    # vex_symbol_hit path hard-capped shard_limit=1 (vex_reference only), so
+    # queries like "Why does VEX fit() give 'call to undefined function'?" never
+    # reached the troubleshooting shard. We track that intent here and use it
+    # to expand the shard limit in retrieve().
+    _has_debug_intent = _contains_any_token(
+        text,
+        ("error", "fix", "debug", "warning", "troubleshoot", "broken", "crash", "wrong", "issue"),
+    )
+
     for shard_name, keywords in SHARD_ROUTE_KEYWORDS.items():
         if _contains_any_phrase(text, keywords):
             boost(shard_name, 6.0)
+
+    if _has_debug_intent:
+        boost("troubleshooting", 6.0)
 
     if _contains_any_phrase(text, ("hda", "digital asset", "otl", "hdamodule", "asset definition")):
         boost("hda_examples", 4.0)
         boost("python_examples", 1.5)
 
-    if _contains_any_phrase(text, ASSET_BUILD_HINTS):
+    direct_node_lookup = _contains_any_phrase(text, NODE_LOOKUP_HINTS) or _contains_any_phrase(
+        text, SOP_LOOKUP_HINTS
+    )
+    asset_build_lookup = _contains_any_phrase(text, BUILD_ACTION_HINTS) and _contains_any_phrase(
+        text, ASSET_OBJECT_HINTS
+    )
+
+    if asset_build_lookup and not direct_node_lookup:
         boost("asset_workflows", 7.0)
         boost("recipes", 2.0)
         boost("sop_nodes", 2.0)
@@ -396,7 +462,7 @@ def _route_query_shards(query: str) -> list[str]:
         boost("sop_nodes", 4.0)
 
     if _contains_any_phrase(text, SOP_LOOKUP_HINTS):
-        boost("sop_nodes", 6.0)
+        boost("sop_nodes", 8.0 if direct_node_lookup else 6.0)
     if _contains_any_phrase(text, OBJ_LOOKUP_HINTS):
         boost("obj_nodes", 6.0)
     if _contains_any_phrase(text, ROP_LOOKUP_HINTS):
@@ -423,6 +489,9 @@ def _route_query_shards(query: str) -> list[str]:
             boost("python_examples", 2.5)
 
     boost("general_reference", 1.0)
+
+    # Attach debug-intent flag so retrieve() can use it for shard-limit decisions.
+    _route_query_shards._last_has_debug_intent = _has_debug_intent
 
     ranked = sorted(
         scores.items(),
@@ -477,6 +546,9 @@ class HybridRetriever:
         min_score: float = 0.05,
         enable_rerank: bool = True,
         prefetch_embeddings: bool = True,
+        max_entry_chars: int = 20000,
+        candidate_pool_size: int = 256,
+        vector_backend: str = "auto",
     ):
         self.kb_path = kb_path
         self._static_entries = (
@@ -487,6 +559,9 @@ class HybridRetriever:
         self.min_score = min_score
         self.enable_rerank = bool(enable_rerank)
         self.prefetch_embeddings = bool(prefetch_embeddings)
+        self.max_entry_chars = int(max_entry_chars)
+        self.candidate_pool_size = max(32, int(candidate_pool_size or 256))
+        self.vector_backend = str(vector_backend or "auto").lower()
 
         self._entries: list[dict] = []
         self._bm25: BM25 | None = None
@@ -498,6 +573,13 @@ class HybridRetriever:
         self._embed_thread: threading.Thread | None = None
         self._embed_lock = threading.Lock()
         self._embed_generation = 0
+        self._vector_index_generation = -1
+        self._vector_index_count = -1
+        self._vector_index_dim = 0
+        self._vector_index_backend = ""
+        self._vector_matrix = None
+        self._vector_entry_indices: list[int] = []
+        self._hnsw_index = None
 
         self._load_kb()
         if self.prefetch_embeddings:
@@ -511,6 +593,16 @@ class HybridRetriever:
         self._vectors = [None] * len(self._entries)
         self._embed_done = False
         self._embed_generation += 1
+        self._invalidate_vector_index()
+
+    def _invalidate_vector_index(self) -> None:
+        self._vector_index_generation = -1
+        self._vector_index_count = -1
+        self._vector_index_dim = 0
+        self._vector_index_backend = ""
+        self._vector_matrix = None
+        self._vector_entry_indices = []
+        self._hnsw_index = None
 
     def _base_kb_path(self) -> str:
         return str(self.kb_path).split("#", 1)[0]
@@ -659,6 +751,12 @@ class HybridRetriever:
         source = str(entry.get("_source", ""))
         content = str(entry.get("content", ""))
 
+        # Cap very large entries so they don't distort BM25 IDF scores or
+        # dilute embedding quality (OBJ rig docs can reach 140k chars).
+        _limit = getattr(self, "max_entry_chars", 20000)
+        if len(content) > _limit:
+            content = content[:_limit] + " [truncated]"
+
         parts = [
             title,
             title,
@@ -677,6 +775,7 @@ class HybridRetriever:
         category = str(entry.get("category", ""))
         tags = [str(tag) for tag in entry.get("tags", [])]
         source = str(entry.get("_source", ""))
+        source_path = os.path.basename(str(entry.get("_source_path", "") or ""))
         content = str(entry.get("content", ""))
         title_lower = title.lower()
         content_lower = content.lower()
@@ -684,6 +783,15 @@ class HybridRetriever:
         tag_tokens = set(BM25.tokenise(" ".join(tags)))
         category_tokens = set(BM25.tokenise(category))
         source_tokens = set(BM25.tokenise(source))
+        symbol = str(
+            entry.get("_vex_symbol")
+            or entry.get("_python_symbol")
+            or entry.get("_hscript_symbol")
+            or entry.get("_intrinsic_name")
+            or entry.get("_node_type")
+            or ""
+        ).strip()
+        symbol_tokens = set(BM25.tokenise(symbol))
 
         return {
             "title_lower": title_lower,
@@ -692,8 +800,32 @@ class HybridRetriever:
             "tag_tokens": tag_tokens,
             "category_tokens": category_tokens,
             "source_tokens": source_tokens,
-            "anchor_tokens": title_tokens | tag_tokens | category_tokens | source_tokens,
-            "is_node_reference": category == "nodes" or title_lower.startswith(NODE_TITLE_PREFIXES),
+            "symbol_lower": symbol.lower(),
+            "symbol_tokens": symbol_tokens,
+            "is_ambiguous_symbol": symbol.lower()
+            in {
+                "set",
+                "add",
+                "remove",
+                "delete",
+                "copy",
+                "append",
+                "insert",
+                "match",
+                "find",
+                "replace",
+                "sort",
+                "reverse",
+                "split",
+            },
+            "anchor_tokens": title_tokens
+            | tag_tokens
+            | category_tokens
+            | source_tokens
+            | symbol_tokens,
+            "is_node_reference": category == "nodes"
+            or title_lower.startswith(NODE_TITLE_PREFIXES)
+            or "sop_node_docs" in f"{source} {source_path}".lower(),
             "is_vex_function": title_lower.startswith("vex function:"),
             "is_hscript_expression": title_lower.startswith("hscript expression:"),
             "is_intrinsic_reference": title_lower.startswith("intrinsic definition:"),
@@ -798,6 +930,138 @@ class HybridRetriever:
             return [0.0] * len(scores)
         return [score / max_score for score in scores]
 
+    @staticmethod
+    def _top_score_indices(
+        scores: list[float], limit: int, min_raw_score: float = 0.0
+    ) -> list[int]:
+        if not scores or limit <= 0:
+            return []
+        limit = min(limit, len(scores))
+        pairs = heapq.nlargest(limit, enumerate(scores), key=lambda item: item[1])
+        return [idx for idx, score in pairs if score > min_raw_score]
+
+    @staticmethod
+    def _normalise_sparse_scores(scores_by_index: dict[int, float]) -> dict[int, float]:
+        if not scores_by_index:
+            return {}
+        max_score = max(scores_by_index.values())
+        if max_score <= 0:
+            return {idx: 0.0 for idx in scores_by_index}
+        return {idx: score / max_score for idx, score in scores_by_index.items()}
+
+    def _build_vector_index(self, vector_snapshot: list[list[float] | None]) -> None:
+        vectors = []
+        entry_indices = []
+        dim = 0
+        for idx, vec in enumerate(vector_snapshot):
+            if not vec:
+                continue
+            if dim == 0:
+                dim = len(vec)
+            if len(vec) != dim:
+                continue
+            vectors.append(vec)
+            entry_indices.append(idx)
+
+        self._invalidate_vector_index()
+        if not vectors or dim <= 0:
+            return
+
+        try:
+            import numpy as np
+
+            matrix = np.asarray(vectors, dtype="float32")
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            matrix = matrix / norms
+            self._vector_matrix = matrix
+            self._vector_entry_indices = entry_indices
+            self._vector_index_dim = dim
+            self._vector_index_count = len(entry_indices)
+            self._vector_index_generation = self._embed_generation
+            self._vector_index_backend = "numpy_exact"
+
+            if self.vector_backend in {"auto", "hnsw", "hnswlib"} and len(entry_indices) >= 512:
+                try:
+                    import hnswlib
+
+                    index = hnswlib.Index(space="cosine", dim=dim)
+                    index.init_index(
+                        max_elements=len(entry_indices),
+                        ef_construction=120,
+                        M=16,
+                    )
+                    index.add_items(matrix, list(range(len(entry_indices))))
+                    index.set_ef(min(128, len(entry_indices)))
+                    self._hnsw_index = index
+                    self._vector_index_backend = "hnswlib"
+                except Exception:
+                    self._hnsw_index = None
+        except Exception:
+            self._invalidate_vector_index()
+
+    def _vector_top_scores(self, q_vec: list[float], limit: int) -> dict[int, float]:
+        if not q_vec or limit <= 0:
+            return {}
+        with self._embed_lock:
+            vector_snapshot = list(self._vectors)
+
+        vector_count = sum(1 for vec in vector_snapshot if vec)
+        if vector_count <= 0:
+            return {}
+
+        if (
+            self._vector_index_generation != self._embed_generation
+            or self._vector_index_count != vector_count
+        ):
+            self._build_vector_index(vector_snapshot)
+
+        if self._vector_matrix is None or not self._vector_entry_indices:
+            scores = {}
+            for idx, vec in enumerate(vector_snapshot):
+                if vec:
+                    scores[idx] = _cosine(q_vec, vec)
+            return {
+                idx: score
+                for idx, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[
+                    :limit
+                ]
+            }
+
+        try:
+            import numpy as np
+
+            query = np.asarray(q_vec, dtype="float32")
+            norm = float(np.linalg.norm(query))
+            if norm <= 0:
+                return {}
+            query = query / norm
+
+            top_n = min(limit, len(self._vector_entry_indices))
+            if self._hnsw_index is not None and self._vector_index_backend == "hnswlib":
+                labels, distances = self._hnsw_index.knn_query(query, k=top_n)
+                result = {}
+                for row_label, row_distance in zip(labels[0], distances[0], strict=False):
+                    row = int(row_label)
+                    if row < 0 or row >= len(self._vector_entry_indices):
+                        continue
+                    result[self._vector_entry_indices[row]] = max(0.0, 1.0 - float(row_distance))
+                return result
+
+            scores = self._vector_matrix @ query
+            if top_n >= len(scores):
+                top_rows = np.argsort(-scores)
+            else:
+                top_rows = np.argpartition(-scores, top_n - 1)[:top_n]
+                top_rows = top_rows[np.argsort(-scores[top_rows])]
+            return {
+                self._vector_entry_indices[int(row)]: float(scores[int(row)])
+                for row in top_rows
+                if float(scores[int(row)]) > 0
+            }
+        except Exception:
+            return {}
+
     def _detect_query_intents(self, query: str, query_terms: list[str]) -> set:
         query_lower = query.lower()
         terms = set(query_terms)
@@ -807,21 +1071,129 @@ class HybridRetriever:
             token in terms for token in ("sop", "dop", "lop", "obj", "rop", "vop")
         ):
             intents.add("node")
-        if "function" in terms or re.search(r"\bfunction\b", query_lower):
+        if "function" in terms or "call" in terms or re.search(r"\bfunction\b", query_lower):
             intents.add("function")
         if "expression" in terms or "hscript" in terms:
             intents.add("expression")
         if "intrinsic" in terms or "intrinsics" in terms:
             intents.add("intrinsic")
-        if terms.intersection({"error", "fix", "debug", "troubleshoot", "troubleshooting"}):
+        if terms.intersection(
+            {
+                "error",
+                "fix",
+                "debug",
+                "troubleshoot",
+                "troubleshooting",
+                "warning",
+                "broken",
+                "crash",
+                "wrong",
+                "issue",
+            }
+        ):
             intents.add("troubleshooting")
-        if terms.intersection({"snippet", "example", "code", "script"}):
+        # Bug fix: "HScript" CamelCase-splits to token "script" via BM25, which
+        # would incorrectly add "example" intent and boost generic code examples
+        # above the correct HScript reference entries. Guard against this by
+        # checking whether the raw query actually contains \bscript\b as a whole
+        # word (i.e. not as part of "hscript").
+        _script_as_word = re.search(r"\bscript\b", query_lower) and "hscript" not in query_lower
+        if terms.intersection({"snippet", "example", "code"}) or _script_as_word:
             intents.add("example")
         if "parameter" in terms or "parm" in terms or "parms" in terms:
             intents.add("parameters")
         if "context" in terms or "contexts" in terms:
             intents.add("contexts")
         return intents
+
+    def _infer_metadata_preferences(self, query: str, query_terms: list[str]) -> dict:
+        """Infer metadata preferences (difficulty, performance) from query."""
+        query_lower = query.lower()
+        prefs = {
+            "preferred_difficulty": None,
+            "prefer_performant": False,
+            "prefer_simple": False,
+            "avoid_severity": None,
+        }
+
+        # Detect difficulty preferences
+        if any(x in query_lower for x in ["beginner", "simple", "basic", "easy", "tutorial"]):
+            prefs["preferred_difficulty"] = "beginner"
+            prefs["prefer_simple"] = True
+        elif any(x in query_lower for x in ["advanced", "complex", "expert", "pro"]):
+            prefs["preferred_difficulty"] = "advanced"
+        elif any(x in query_lower for x in ["how do i", "how to", "example", "snippet"]):
+            prefs["preferred_difficulty"] = "beginner"
+            prefs["prefer_simple"] = True
+
+        # Detect performance concerns
+        if any(
+            x in query_lower for x in ["slow", "fast", "performance", "optimize", "speed", "lag"]
+        ):
+            prefs["prefer_performant"] = True
+
+        # Detect severity preferences for errors
+        if any(x in query_lower for x in ["crash", "fatal", "broken", "critical"]):
+            prefs["avoid_severity"] = "low"
+
+        return prefs
+
+    def _metadata_boost(self, entry: dict, prefs: dict) -> float:
+        """Calculate boost based on metadata alignment with preferences."""
+        boost = 0.0
+
+        difficulty = entry.get("difficulty", "").lower()
+        if prefs.get("preferred_difficulty") and difficulty == prefs["preferred_difficulty"]:
+            boost += 0.25
+
+        if prefs.get("prefer_simple") and difficulty in ("beginner", "reference"):
+            boost += 0.15
+
+        if prefs.get("prefer_performant"):
+            perf = entry.get("performance_impact", "").lower()
+            if perf in ("low", "optimal"):
+                boost += 0.18
+            elif perf == "medium":
+                boost += 0.06
+
+        severity = entry.get("severity", "").lower()
+        if prefs.get("avoid_severity") and severity != prefs["avoid_severity"]:
+            boost += 0.08
+
+        return boost
+
+    # Source tiers (highest → lowest confidence):
+    #   tier-1: internal verified recipes / high-fidelity training data
+    #   tier-2: official Houdini docs, sop_node_docs
+    #   tier-3: community / synthetic generated examples
+    _SOURCE_QUALITY_BOOSTS: dict[str, float] = {
+        # tier-1: internal verified recipes
+        "node_chain_training": 0.35,
+        "high_fidelity": 0.30,
+        "houdinimind_agent_recipes": 0.30,
+        # tier-2: official reference
+        "sop_node_docs": 0.18,
+        "houdini_python_functions_json": 0.20,
+        "houdini_100_vex_examples": 0.24,
+        "vex_functions_db": 0.20,
+        "houdini_python": 0.15,
+        "houdini_knowledge": 0.10,
+        "vex_dataset": 0.04,
+        # tier-3: generated / community
+        "synthetic": -0.10,
+        "generated": -0.08,
+        "community": -0.05,
+    }
+
+    def _source_quality_boost(self, entry: dict) -> float:
+        src = str(entry.get("_source", "") or entry.get("source", "")).lower()
+        src_path = os.path.basename(str(entry.get("_source_path", "") or "")).lower()
+        combined = src + " " + src_path
+        boost = 0.0
+        for key, val in self._SOURCE_QUALITY_BOOSTS.items():
+            if key in combined:
+                boost = max(boost, val) if val > 0 else min(boost, val)
+        return boost
 
     def _looks_exact_lookup(self, query: str, query_terms: list[str], intents: set) -> bool:
         if intents.intersection({"node", "function", "expression", "intrinsic", "troubleshooting"}):
@@ -848,12 +1220,18 @@ class HybridRetriever:
         if "intrinsic" in intents and features["is_intrinsic_reference"]:
             boost += 0.38
         if "troubleshooting" in intents and features["is_troubleshooting"]:
-            boost += 0.34
+            boost += 0.8
         if "example" in intents:
             if features["is_explicit_example"]:
                 boost += 0.2
                 if "vex" in query_terms and "vex" in features["anchor_tokens"]:
                     boost += 0.06
+                if {"add", "y"}.issubset(features["title_tokens"]) and {
+                    "move",
+                    "upward",
+                    "y",
+                }.intersection(query_terms):
+                    boost += 0.55
             elif features["is_snippet_reference"]:
                 boost += 0.08
 
@@ -870,6 +1248,8 @@ class HybridRetriever:
         title_tokens = features["title_tokens"]
         tag_tokens = features["tag_tokens"]
         anchor_tokens = features["anchor_tokens"]
+        symbol_lower = features.get("symbol_lower", "")
+        symbol_tokens = features.get("symbol_tokens", set())
         content_lower = features["content_lower"]
 
         informative_terms = []
@@ -895,6 +1275,21 @@ class HybridRetriever:
                 boost += min(token_idf / 16.0, 0.14)
             elif token in content_lower:
                 boost += min(token_idf / 22.0, 0.08)
+
+        if symbol_lower:
+            symbol_context_ok = (not features.get("is_ambiguous_symbol")) or bool(
+                {"vex", "wrangle", "function"}.intersection(query_terms)
+            )
+            if symbol_context_ok and symbol_lower in informative_terms:
+                boost += 0.75
+                if features["is_vex_function"] or features["is_hscript_expression"]:
+                    boost += 0.25
+            elif (
+                symbol_context_ok
+                and symbol_tokens
+                and symbol_tokens.issubset(set(informative_terms))
+            ):
+                boost += 0.35
 
         if informative_terms:
             coverage = matched_anchor_terms / len(informative_terms)
@@ -951,7 +1346,9 @@ class HybridRetriever:
             try:
                 q_vec = self.embed_fn(query)
                 if q_vec:
-                    for i, vec in enumerate(self._vectors):
+                    with self._embed_lock:
+                        snapshot = list(self._vectors)
+                    for i, vec in enumerate(snapshot):
                         if vec:
                             cosine_scores[i] = _cosine(q_vec, vec)
             except Exception:
@@ -985,6 +1382,9 @@ class HybridRetriever:
         include_categories: list[str] | None = None,
         exclude_categories: list[str] | None = None,
         include_memory: bool = True,
+        difficulty_filter: str | None = None,
+        max_performance_impact: str | None = None,
+        prefer_performant: bool = False,
         **kwargs,
     ) -> list[dict]:
         if not self._entries or not self._bm25:
@@ -999,6 +1399,13 @@ class HybridRetriever:
         )
         intents = self._detect_query_intents(query, query_terms)
 
+        # ── Infer & apply metadata preferences ─────────────────────────
+        inferred_prefs = self._infer_metadata_preferences(query, query_terms)
+        if prefer_performant:
+            inferred_prefs["prefer_performant"] = True
+        if difficulty_filter:
+            inferred_prefs["preferred_difficulty"] = difficulty_filter
+
         # ── BM25 scores ──────────────────────────────────────────────
         bm25_scores = self._safe_bm25_scores(query)
         expanded_bm25_scores = (
@@ -1006,11 +1413,25 @@ class HybridRetriever:
             if expanded_query_text and expanded_query_text != query
             else list(bm25_scores)
         )
-        bm25_norm = self._normalise_scores(bm25_scores)
-        expanded_bm25_norm = self._normalise_scores(expanded_bm25_scores)
+        candidate_limit = max(
+            top_k * 12, int(kwargs.get("candidate_pool_size", self.candidate_pool_size))
+        )
+        bm25_top = self._top_score_indices(bm25_scores, candidate_limit)
+        expanded_top = (
+            self._top_score_indices(expanded_bm25_scores, max(candidate_limit // 2, top_k * 4))
+            if expanded_query_text != query
+            else []
+        )
+        bm25_norm_by_idx = self._normalise_sparse_scores(
+            {idx: bm25_scores[idx] for idx in bm25_top}
+        )
+        expanded_norm_by_idx = self._normalise_sparse_scores(
+            {idx: expanded_bm25_scores[idx] for idx in expanded_top}
+        )
 
         # ── Semantic scores ───────────────────────────────────────────
-        cosine_scores = [0.0] * len(self._entries)
+        cosine_scores_by_idx: dict[int, float] = {}
+        current_vectors = []
         q_vec = None
         if self.embed_fn and self.hybrid_weight > 0:
             self._ensure_embeddings()
@@ -1019,13 +1440,15 @@ class HybridRetriever:
             except Exception:
                 pass
             if q_vec:
-                current_vectors = list(self._vectors)
-                for i, vec in enumerate(current_vectors):
-                    if vec:
-                        cosine_scores[i] = _cosine(q_vec, vec)
+                with self._embed_lock:
+                    current_vectors = list(self._vectors)
+                cosine_scores_by_idx = self._vector_top_scores(q_vec, candidate_limit)
 
-        cosine_norm = self._normalise_scores(cosine_scores)
-        cosine_active = any(score > 0.0 for score in cosine_scores)
+        cosine_norm_by_idx = self._normalise_sparse_scores(cosine_scores_by_idx)
+        cosine_active = bool(cosine_scores_by_idx)
+        candidate_indices = set(bm25_top) | set(expanded_top) | set(cosine_scores_by_idx)
+        if not candidate_indices or len(self._entries) <= candidate_limit:
+            candidate_indices.update(range(len(self._entries)))
 
         # ── Setup MMR / RRF  ────────────────────────────────────────────
         use_rrf = kwargs.get("use_rrf", True)
@@ -1038,9 +1461,7 @@ class HybridRetriever:
 
         rank_maps: list[tuple[dict[int, int], float]] = []
         if use_rrf:
-            bm25_ranked = sorted(
-                range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-            )
+            bm25_ranked = sorted(bm25_top, key=lambda i: bm25_scores[i], reverse=True)
             rank_maps.append(
                 (
                     {idx: rank + 1 for rank, idx in enumerate(bm25_ranked)},
@@ -1048,11 +1469,9 @@ class HybridRetriever:
                 )
             )
 
-            if expanded_query_text != query and any(score > 0.0 for score in expanded_bm25_scores):
+            if expanded_query_text != query and expanded_top:
                 expanded_ranked = sorted(
-                    range(len(expanded_bm25_scores)),
-                    key=lambda i: expanded_bm25_scores[i],
-                    reverse=True,
+                    expanded_top, key=lambda i: expanded_bm25_scores[i], reverse=True
                 )
                 rank_maps.append(
                     (
@@ -1063,14 +1482,15 @@ class HybridRetriever:
 
             if cosine_active:
                 cosine_ranked = sorted(
-                    range(len(cosine_scores)), key=lambda i: cosine_scores[i], reverse=True
+                    cosine_scores_by_idx, key=lambda i: cosine_scores_by_idx[i], reverse=True
                 )
                 rank_maps.append(
                     ({idx: rank + 1 for rank, idx in enumerate(cosine_ranked)}, self.hybrid_weight)
                 )
 
         scored = []
-        for i, entry in enumerate(self._entries):
+        for i in candidate_indices:
+            entry = self._entries[i]
             category = entry.get("category", "")
             if category_filter and category != category_filter:
                 continue
@@ -1079,11 +1499,24 @@ class HybridRetriever:
             if exclude_categories and category in exclude_categories:
                 continue
 
-            base_score = primary_lexical_weight * bm25_norm[i]
+            # ── Metadata filtering ──────────────────────────────────────
+            if difficulty_filter:
+                entry_difficulty = entry.get("difficulty", "").lower()
+                if entry_difficulty != difficulty_filter.lower():
+                    continue
+
+            if max_performance_impact:
+                impact = entry.get("performance_impact", "").lower()
+                impact_order = {"low": 0, "medium": 1, "high": 2}
+                max_order = impact_order.get(max_performance_impact.lower(), 999)
+                if impact_order.get(impact, 999) > max_order:
+                    continue
+
+            base_score = primary_lexical_weight * bm25_norm_by_idx.get(i, 0.0)
             if expanded_query_text != query:
-                base_score += expanded_lexical_weight * expanded_bm25_norm[i]
+                base_score += expanded_lexical_weight * expanded_norm_by_idx.get(i, 0.0)
             if cosine_active:
-                base_score += self.hybrid_weight * cosine_norm[i]
+                base_score += self.hybrid_weight * cosine_norm_by_idx.get(i, 0.0)
             if rank_maps:
                 base_score += 8.0 * self._weighted_rrf(rank_maps, i)
 
@@ -1096,6 +1529,8 @@ class HybridRetriever:
                 base_score
                 + self._intent_boost(features, intents, query_terms)
                 + self._exact_match_boost(i, features, query_terms, expanded_terms)
+                + self._metadata_boost(entry, inferred_prefs)
+                + self._source_quality_boost(entry)
             )
 
             if score >= min_score:
@@ -1115,12 +1550,17 @@ class HybridRetriever:
                 best_idx = -1
 
                 for idx in unselected:
-                    sim_q = cosine_scores[idx]
+                    sim_q = cosine_scores_by_idx.get(idx, 0.0)
                     sim_sel = 0.0
                     if selected:
                         sim_sel = max(
-                            _cosine(self._vectors[idx], self._vectors[s])
-                            if self._vectors[idx] and self._vectors[s]
+                            _cosine(current_vectors[idx], current_vectors[s])
+                            if (
+                                idx < len(current_vectors)
+                                and s < len(current_vectors)
+                                and current_vectors[idx]
+                                and current_vectors[s]
+                            )
                             else 0.0
                             for s in selected
                         )
@@ -1275,6 +1715,9 @@ class QueryAwareShardRetriever:
         enable_rerank: bool = True,
         max_shards_per_query: int = 3,
         shard_prefetch_embeddings: bool = False,
+        max_entry_chars: int = 20000,
+        candidate_pool_size: int = 256,
+        vector_backend: str = "auto",
     ):
         self.kb_path = kb_path
         self.embed_fn = embed_fn
@@ -1283,11 +1726,16 @@ class QueryAwareShardRetriever:
         self.enable_rerank = bool(enable_rerank)
         self.max_shards_per_query = max(1, int(max_shards_per_query or 3))
         self.shard_prefetch_embeddings = bool(shard_prefetch_embeddings)
+        self.max_entry_chars = int(max_entry_chars)
+        self.candidate_pool_size = max(32, int(candidate_pool_size or 256))
+        self.vector_backend = str(vector_backend or "auto").lower()
 
         self._entries: list[dict] = []
         self._entry_by_id: dict[str, dict] = {}
         self._entries_by_shard: dict[str, list[dict]] = {}
         self._shard_categories: dict[str, set] = {}
+        self._vex_symbols: set[str] = set()
+        self._python_symbols: set[str] = set()
         self._loaded_shards: dict[str, HybridRetriever] = {}
         self._runtime_entries: list[dict] = []
         self.last_route_meta: dict = {}
@@ -1307,22 +1755,117 @@ class QueryAwareShardRetriever:
         entry_by_id: dict[str, dict] = {}
         entries_by_shard: dict[str, list[dict]] = {}
         shard_categories: dict[str, set] = {}
+        vex_symbols: set[str] = set()
+        python_symbols: set[str] = set()
 
         for idx, entry in enumerate(entries):
             assigned = self._assign_entry_id(entry, idx)
+            shard_name = _entry_shard_name(assigned)
+            if (
+                shard_name.endswith("_nodes")
+                and str(assigned.get("category", "")).lower() != "nodes"
+            ):
+                assigned["category"] = "nodes"
             indexed.append(assigned)
             entry_by_id[str(assigned.get("_id"))] = assigned
-            shard_name = _entry_shard_name(assigned)
             entries_by_shard.setdefault(shard_name, []).append(assigned)
             shard_categories.setdefault(shard_name, set()).add(
                 str(assigned.get("category", "") or "").lower()
             )
+            if shard_name == "vex_reference":
+                symbol = str(assigned.get("_vex_symbol") or "").strip().lower()
+                if symbol:
+                    vex_symbols.add(symbol)
+            if shard_name == "python_examples":
+                symbol = str(assigned.get("_python_symbol") or "").strip().lower()
+                aliases = assigned.get("_python_aliases") or []
+                for candidate in [symbol, *aliases]:
+                    candidate = str(candidate or "").strip().lower()
+                    if candidate:
+                        python_symbols.add(candidate)
 
         self._entries = indexed
         self._entry_by_id = entry_by_id
         self._entries_by_shard = entries_by_shard
         self._shard_categories = shard_categories
+        self._vex_symbols = vex_symbols
+        self._python_symbols = python_symbols
         self._loaded_shards = {}
+
+    def _query_mentions_vex_symbol(self, query: str) -> bool:
+        if not self._vex_symbols:
+            return False
+        query_lower = str(query or "").lower()
+        query_symbols = {
+            match.group(0).lower()
+            for match in re.finditer(r"(?<![@.])\b[A-Za-z_][A-Za-z0-9_]*\b", str(query or ""))
+        }
+        hits = query_symbols & self._vex_symbols
+        if not hits:
+            return False
+        ambiguous_prose_symbols = {
+            "set",
+            "add",
+            "remove",
+            "delete",
+            "copy",
+            "append",
+            "insert",
+            "match",
+            "find",
+            "replace",
+            "sort",
+            "reverse",
+            "split",
+        }
+        if hits <= ambiguous_prose_symbols and not _contains_any_phrase(
+            query_lower,
+            SHARD_ROUTE_KEYWORDS["vex_reference"],
+        ):
+            return False
+        return True
+
+    def _query_python_symbols(self, query: str) -> set[str]:
+        text = str(query or "").lower()
+        if "hscript" in text and "hou." not in text:
+            return set()
+        dotted_symbols = {match.group(0) for match in re.finditer(r"\bhou(?:\.[a-z_]\w*)+\b", text)}
+        bare_symbols = set()
+        for match in re.finditer(r"(?<![@.])\b[A-Za-z_][A-Za-z0-9_]*\b", str(query or "")):
+            raw = match.group(0)
+            # Avoid treating ordinary lowercase prose words like "float" or
+            # "parameter" as exact HOM symbols. Bare exact HOM lookups usually
+            # arrive as camelCase (createNode, setParmTemplateGroup) or snake_case.
+            if "_" not in raw and not any(ch.isupper() for ch in raw[1:]):
+                continue
+            bare_symbols.add(raw.lower())
+        return (dotted_symbols | bare_symbols) & self._python_symbols
+
+    def _query_mentions_python_symbol(self, query: str) -> bool:
+        if not self._python_symbols:
+            return False
+        return bool(self._query_python_symbols(query))
+
+    def _exact_python_symbol_results(self, query: str, top_k: int) -> list[dict]:
+        matches = self._query_python_symbols(query)
+        if not matches:
+            return []
+        results = []
+        for entry in self._entries_by_shard.get("python_examples", []):
+            aliases = {
+                str(alias or "").strip().lower()
+                for alias in (entry.get("_python_aliases") or [entry.get("_python_symbol")])
+                if str(alias or "").strip()
+            }
+            if not (aliases & matches):
+                continue
+            candidate = dict(entry)
+            candidate["id"] = candidate.get("_id")
+            candidate["_score"] = 9.0
+            results.append(candidate)
+            if len(results) >= top_k:
+                break
+        return results
 
     def _load_kb(self):
         if not os.path.exists(self.kb_path):
@@ -1392,6 +1935,9 @@ class QueryAwareShardRetriever:
             min_score=self.min_score,
             enable_rerank=self.enable_rerank,
             prefetch_embeddings=self.shard_prefetch_embeddings,
+            max_entry_chars=self.max_entry_chars,
+            candidate_pool_size=self.candidate_pool_size,
+            vector_backend=self.vector_backend,
         )
         self._loaded_shards[shard_name] = retriever
         return retriever
@@ -1411,6 +1957,13 @@ class QueryAwareShardRetriever:
             sort_keys=True,
             default=str,
         )
+
+    @staticmethod
+    def _result_dedupe_key(entry: dict) -> str:
+        title = re.sub(r"\s+", " ", str(entry.get("title", "") or "").strip().lower())
+        if title:
+            return f"title:{title}"
+        return f"id:{QueryAwareShardRetriever._result_identity(entry)}"
 
     def _merge_results(
         self,
@@ -1436,6 +1989,14 @@ class QueryAwareShardRetriever:
             key=lambda item: item.get("_score", 0.0),
             reverse=True,
         )
+        deduped = []
+        seen_titles = set()
+        for entry in ordered:
+            key = self._result_dedupe_key(entry)
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            deduped.append(entry)
 
         results = []
         if include_live_scene:
@@ -1448,7 +2009,7 @@ class QueryAwareShardRetriever:
                     "_score": 1.0,
                 }
             )
-        results.extend(ordered[:top_k])
+        results.extend(deduped[:top_k])
         return results
 
     def retrieve(
@@ -1461,6 +2022,9 @@ class QueryAwareShardRetriever:
         include_categories: list[str] | None = None,
         exclude_categories: list[str] | None = None,
         include_memory: bool = True,
+        difficulty_filter: str | None = None,
+        max_performance_impact: str | None = None,
+        prefer_performant: bool = False,
         **kwargs,
     ) -> list[dict]:
         if not self._entries:
@@ -1473,6 +2037,14 @@ class QueryAwareShardRetriever:
             exclude_categories=exclude_categories,
         )
         routed = [name for name in _route_query_shards(query) if name in eligible]
+        python_symbol_hit = "python_examples" in eligible and self._query_mentions_python_symbol(
+            query
+        )
+        vex_symbol_hit = "vex_reference" in eligible and self._query_mentions_vex_symbol(query)
+        if python_symbol_hit:
+            routed = ["python_examples"] + [name for name in routed if name != "python_examples"]
+        if vex_symbol_hit and not python_symbol_hit:
+            routed = ["vex_reference"] + [name for name in routed if name != "vex_reference"]
         if not routed:
             routed = list(eligible)
 
@@ -1495,6 +2067,14 @@ class QueryAwareShardRetriever:
             len(routed),
             self.max_shards_per_query + (2 if _sim_domains_hit >= 2 else 0),
         )
+        if python_symbol_hit and "hou." in str(query or "").lower() and not vex_symbol_hit:
+            shard_limit = min(shard_limit, 1)
+        # Bug fix: don't lock to a single shard when query has both a VEX symbol
+        # AND a debug/error signal. E.g. "VEX fit() undefined function error" must
+        # search both vex_reference AND troubleshooting.
+        _last_debug = getattr(_route_query_shards, "_last_has_debug_intent", False)
+        if vex_symbol_hit and not python_symbol_hit and not _last_debug:
+            shard_limit = min(shard_limit, 1)
         local_top_k = max(top_k * 2, 6)
 
         for shard_name in routed[:shard_limit]:
@@ -1511,6 +2091,9 @@ class QueryAwareShardRetriever:
                 include_categories=include_categories,
                 exclude_categories=exclude_categories,
                 include_memory=include_memory,
+                difficulty_filter=difficulty_filter,
+                max_performance_impact=max_performance_impact,
+                prefer_performant=prefer_performant,
                 **kwargs,
             )
             if results:
@@ -1521,6 +2104,19 @@ class QueryAwareShardRetriever:
             top_k=top_k,
             include_live_scene=include_live_scene,
         )
+        if python_symbol_hit:
+            exact_python = self._exact_python_symbol_results(query, top_k)
+            if exact_python:
+                seen_exact = {self._result_identity(entry) for entry in exact_python}
+                live = [item for item in merged if item.get("id") == "live_scene"]
+                rest = [
+                    item
+                    for item in merged
+                    if item.get("id") != "live_scene"
+                    and self._result_identity(item) not in seen_exact
+                ]
+                merged = live + exact_python + rest
+                merged = merged[: top_k + len(live)]
 
         if len([item for item in merged if item.get("id") != "live_scene"]) < top_k:
             for shard_name in eligible:
@@ -1539,6 +2135,9 @@ class QueryAwareShardRetriever:
                     include_categories=include_categories,
                     exclude_categories=exclude_categories,
                     include_memory=include_memory,
+                    difficulty_filter=difficulty_filter,
+                    max_performance_impact=max_performance_impact,
+                    prefer_performant=prefer_performant,
                     **kwargs,
                 )
                 if results:

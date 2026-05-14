@@ -111,6 +111,12 @@ pip install --upgrade pip
 pip install -e ".[dev]"
 ```
 
+For local microphone transcription support in the panel, install the optional ASR extra:
+
+```bash
+pip install -e ".[asr]"
+```
+
 **Windows (PowerShell):**
 
 ```powershell
@@ -222,7 +228,7 @@ houdinimind eval --suite tests/fixtures/eval_suite.jsonl
 
 The MCP server lets external editors like Cursor co-drive a live Houdini session.
 
-**Step 1 — Start the MCP server in Houdini.** In the HoudiniMind panel toolbar, click **Toggle MCP Server**. The status bar shows `MCP: 127.0.0.1:9876`.
+**Step 1 — Start the MCP server in Houdini.** Open the **Settings (⚙)** in the HoudiniMind panel, scroll to the **MCP** section, and click **Start Server**. The status bar shows `MCP: 127.0.0.1:9876`.
 
 **Step 2 — Configure your client.** Open `mcp_config_example.json` in the repo root and copy the block for your client (Cursor, Claude Desktop, etc.) into that client's config file. Replace `/path/to/HoudiniMind` with the actual path where you cloned the repo.
 

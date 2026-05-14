@@ -46,11 +46,18 @@ except Exception:
 
 
 try:
-    import hou
+    import hou as _hou
 
-    HOU_AVAILABLE = True
+    HOU_AVAILABLE = bool(_hou)
 except ImportError:
     HOU_AVAILABLE = False
+
+
+# Placeholder shown in the model dropdown when the user switches to the NVIDIA
+# backend without having configured a model and no /models response is
+# available yet. Kept neutral so the UI does not implicitly recommend any
+# particular model family.
+NVIDIA_PLACEHOLDER_MODEL = ""
 
 
 # ── Modern UI System ──────────────────────────────────────────────────
@@ -608,15 +615,14 @@ QUICK_PROMPTS = [
 # ══════════════════════════════════════════════════════════════════════
 
 
-NVIDIA_PLACEHOLDER_MODEL = ""
-
-
 class ModelCombo(QtWidgets.QComboBox):
     """ComboBox that can be populated from Ollama /api/tags."""
 
     def __init__(self, placeholder: str = "Select model…", parent=None):
         super().__init__(parent)
         self._placeholder = placeholder
+        self.setEditable(True)
+        self.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.addItem(placeholder)
         self.setMinimumWidth(150)
 
@@ -625,6 +631,9 @@ class ModelCombo(QtWidgets.QComboBox):
         self.clear()
         if not models:
             self.addItem("(no models found)")
+            if current:
+                self.addItem(current)
+                self.setCurrentText(current)
         else:
             for m in models:
                 self.addItem(m)
@@ -632,7 +641,11 @@ class ModelCombo(QtWidgets.QComboBox):
             if idx >= 0:
                 self.setCurrentIndex(idx)
             else:
-                self.setCurrentIndex(0)
+                if current:
+                    self.addItem(current)
+                    self.setCurrentText(current)
+                else:
+                    self.setCurrentIndex(0)
         self.blockSignals(False)
 
     def current_model(self) -> str:
@@ -649,6 +662,7 @@ class ModelCombo(QtWidgets.QComboBox):
 
 class SettingsPanel(QtWidgets.QFrame):
     settings_changed = QtCore.Signal(dict)
+    doctor_requested = QtCore.Signal()
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
@@ -662,9 +676,26 @@ class SettingsPanel(QtWidgets.QFrame):
         root.setContentsMargins(14, 12, 14, 14)
         root.setSpacing(10)
 
+        title_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Settings")
         title.setStyleSheet(f"font-weight: 700; font-size: 12px; color: {ModernStyles.TEXT};")
-        root.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        self.doctor_btn = QtWidgets.QPushButton("Health Check")
+        self.doctor_btn.setObjectName("ghost_btn")
+        self.doctor_btn.setToolTip("Run startup, model, RAG, memory, Houdini, and MCP checks")
+        self.doctor_btn.clicked.connect(self.doctor_requested.emit)
+        title_row.addWidget(self.doctor_btn)
+        root.addLayout(title_row)
+
+        self.settings_search_edit = QtWidgets.QLineEdit()
+        self.settings_search_edit.setPlaceholderText("Search settings")
+        self.settings_search_edit.textChanged.connect(self._filter_sections)
+        root.addWidget(self.settings_search_edit)
+
+        self.settings_sections = QtWidgets.QToolBox()
+        root.addWidget(self.settings_sections)
+        self._section_widgets = []
 
         models_box = QtWidgets.QGroupBox("Models")
         models_layout = QtWidgets.QVBoxLayout(models_box)
@@ -696,6 +727,18 @@ class SettingsPanel(QtWidgets.QFrame):
         model_row.addWidget(self.refresh_models_btn, 0, QtCore.Qt.AlignBottom)
         models_layout.addLayout(model_row)
 
+        self.model_status_lbl = QtWidgets.QLabel("Model status will appear here.")
+        self.model_status_lbl.setWordWrap(True)
+        self.model_status_lbl.setStyleSheet(f"color: {ModernStyles.TEXT_DIM}; font-size: 10px;")
+        models_layout.addWidget(self.model_status_lbl)
+        self.settings_sections.addItem(models_box, "Models")
+        self._section_widgets.append((models_box, "models chat vision backend ollama nvidia"))
+
+        speech_box = QtWidgets.QGroupBox("Speech")
+        speech_layout = QtWidgets.QVBoxLayout(speech_box)
+        speech_layout.setContentsMargins(12, 14, 12, 12)
+        speech_layout.setSpacing(8)
+
         asr_row = QtWidgets.QHBoxLayout()
         asr_row.setSpacing(8)
         asr_col = QtWidgets.QVBoxLayout()
@@ -717,7 +760,7 @@ class SettingsPanel(QtWidgets.QFrame):
         asr_col.addWidget(asr_label)
         asr_col.addWidget(self.asr_model_combo)
         asr_row.addLayout(asr_col, stretch=1)
-        models_layout.addLayout(asr_row)
+        speech_layout.addLayout(asr_row)
 
         mic_row = QtWidgets.QHBoxLayout()
         mic_row.setSpacing(6)
@@ -733,10 +776,13 @@ class SettingsPanel(QtWidgets.QFrame):
         self.asr_input_combo.currentIndexChanged.connect(self._emit)
         mic_row.addWidget(mic_label)
         mic_row.addWidget(self.asr_input_combo, stretch=1)
-        models_layout.addLayout(mic_row)
-        root.addWidget(models_box)
+        speech_layout.addLayout(mic_row)
+        self.settings_sections.addItem(speech_box, "Speech")
+        self._section_widgets.append((speech_box, "speech asr mic microphone voice input"))
 
-        grid = QtWidgets.QFormLayout()
+        runtime_box = QtWidgets.QGroupBox("Runtime")
+        grid = QtWidgets.QFormLayout(runtime_box)
+        grid.setContentsMargins(12, 14, 12, 12)
         grid.setSpacing(8)
         grid.setLabelAlignment(QtCore.Qt.AlignRight)
 
@@ -784,72 +830,262 @@ class SettingsPanel(QtWidgets.QFrame):
         # Ollama URL
         self.url_edit = QtWidgets.QLineEdit(config.get("ollama_url", "http://localhost:11434"))
         self.url_edit.editingFinished.connect(self._emit)
-
         self.url_label = QtWidgets.QLabel("Ollama URL:")
         grid.addRow(self.url_label, self.url_edit)
 
-        self.openai_url_label = QtWidgets.QLabel("NVIDIA URL:")
+        # OpenAI-compatible cloud API settings (NVIDIA NIM)
         self.openai_url_edit = QtWidgets.QLineEdit(
-            str(config.get("openai_base_url", "https://integrate.api.nvidia.com/v1") or "")
+            config.get("openai_base_url", "https://integrate.api.nvidia.com/v1")
         )
-        self.openai_url_edit.setToolTip("Base URL for NVIDIA NIM backend.")
+        self.openai_url_edit.setToolTip("OpenAI-compatible API base URL.")
         self.openai_url_edit.editingFinished.connect(self._emit)
+        self.openai_url_label = QtWidgets.QLabel("API URL:")
         grid.addRow(self.openai_url_label, self.openai_url_edit)
 
-        self.api_key_label = QtWidgets.QLabel("API Key:")
-        self.api_key_edit = QtWidgets.QLineEdit()
+        # SECURITY: Load API key from secure credential store, not plaintext config
+        _initial_api_key = ""
+        try:
+            from houdinimind.agent.credential_store import CredentialStore
+
+            _cred = CredentialStore(config.get("data_dir", ""))
+            _initial_api_key = _cred.get_api_key()
+        except Exception:
+            _initial_api_key = config.get("api_key", "")
+        self.api_key_edit = QtWidgets.QLineEdit(_initial_api_key)
         self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.api_key_edit.setPlaceholderText("Paste NVIDIA API key")
-
-        api_key = str(config.get("api_key", "") or "")
-        self.api_key_edit.setText(api_key)
+        self.api_key_edit.setToolTip(
+            "Bearer API key used for NVIDIA NIM/OpenAI-compatible requests.\n"
+            "Stored securely in macOS Keychain / OS credential manager."
+        )
         self.api_key_edit.editingFinished.connect(self._emit)
+        self.api_key_label = QtWidgets.QLabel("API key:")
         grid.addRow(self.api_key_label, self.api_key_edit)
+
+        self.settings_sections.addItem(runtime_box, "Runtime")
+        self._section_widgets.append(
+            (
+                runtime_box,
+                "runtime backend temperature context window max tool rounds url api key nvidia ollama",
+            )
+        )
+
+        safety_box = QtWidgets.QGroupBox("Scene Safety")
+        safety_grid = QtWidgets.QFormLayout(safety_box)
+        safety_grid.setContentsMargins(12, 14, 12, 12)
+        safety_grid.setSpacing(8)
+        safety_grid.setLabelAlignment(QtCore.Qt.AlignRight)
 
         # Auto-backup
         self.backup_chk = QtWidgets.QCheckBox("Enabled")
         self.backup_chk.setChecked(bool(config.get("auto_backup", False)))
         self.backup_chk.stateChanged.connect(self._emit)
-        grid.addRow("Auto-backup:", self.backup_chk)
+        safety_grid.addRow("Auto-backup:", self.backup_chk)
 
         # Auto-inject scene
         self.scene_chk = QtWidgets.QCheckBox("Inject scene on every message")
         self.scene_chk.setChecked(config.get("ui", {}).get("auto_inject_scene_on_chat", False))
         self.scene_chk.stateChanged.connect(self._emit)
-        grid.addRow("Auto scene:", self.scene_chk)
+        safety_grid.addRow("Auto scene:", self.scene_chk)
 
         # Show tool calls
         self.tools_chk = QtWidgets.QCheckBox("Show tool activity inspector")
         self.tools_chk.setChecked(config.get("ui", {}).get("show_tool_calls", True))
         self.tools_chk.stateChanged.connect(self._emit)
-        grid.addRow("Tool display:", self.tools_chk)
+        safety_grid.addRow("Tool display:", self.tools_chk)
+
+        self.llm_trace_chk = QtWidgets.QCheckBox("Show full LLM thinking in chat")
+        self.llm_trace_chk.setChecked(config.get("ui", {}).get("show_llm_trace_history", True))
+        self.llm_trace_chk.stateChanged.connect(self._emit)
+        safety_grid.addRow("LLM thinking:", self.llm_trace_chk)
 
         # Network view audit (important for Inspect Network quality)
         self.network_audit_chk = QtWidgets.QCheckBox("Analyze network screenshot + wiring")
         self.network_audit_chk.setChecked(config.get("auto_network_view_checks", True))
         self.network_audit_chk.stateChanged.connect(self._emit)
-        grid.addRow("Network Audit:", self.network_audit_chk)
+        safety_grid.addRow("Network Audit:", self.network_audit_chk)
 
-        root.addLayout(grid)
+        self.settings_sections.addItem(safety_box, "Scene Safety")
+        self._section_widgets.append(
+            (
+                safety_box,
+                "scene safety auto backup inject tool display llm thinking trace network audit",
+            )
+        )
+
+        # MCP Server
+        mcp_box = QtWidgets.QGroupBox("MCP Server")
+        mcp_layout = QtWidgets.QVBoxLayout(mcp_box)
+        mcp_layout.setContentsMargins(12, 14, 12, 12)
+        mcp_layout.setSpacing(8)
+
+        mcp_row = QtWidgets.QHBoxLayout()
+        mcp_row.setSpacing(8)
+
+        mcp_port_col = QtWidgets.QVBoxLayout()
+        mcp_port_col.setSpacing(4)
+        mcp_port_label = QtWidgets.QLabel("Port")
+        mcp_port_label.setStyleSheet(
+            f"color: {ModernStyles.TEXT_SUBTLE}; font-size: 10px; font-weight: 600;"
+        )
+        self.mcp_port_spin = QtWidgets.QSpinBox()
+        self.mcp_port_spin.setRange(1024, 65535)
+        self.mcp_port_spin.setValue(config.get("mcp_port", 9876))
+        self.mcp_port_spin.valueChanged.connect(self._emit)
+        mcp_port_col.addWidget(mcp_port_label)
+        mcp_port_col.addWidget(self.mcp_port_spin)
+        mcp_row.addLayout(mcp_port_col, stretch=1)
+
+        mcp_status_col = QtWidgets.QVBoxLayout()
+        mcp_status_col.setSpacing(4)
+        mcp_status_label = QtWidgets.QLabel("Status")
+        mcp_status_label.setStyleSheet(
+            f"color: {ModernStyles.TEXT_SUBTLE}; font-size: 10px; font-weight: 600;"
+        )
+        self.mcp_status_indicator = QtWidgets.QLabel("● Stopped")
+        self.mcp_status_indicator.setStyleSheet(
+            f"color: {ModernStyles.TEXT_DIM}; font-size: 11px; font-weight: 600;"
+        )
+        mcp_status_col.addWidget(mcp_status_label)
+        mcp_status_col.addWidget(self.mcp_status_indicator)
+        mcp_row.addLayout(mcp_status_col, stretch=1)
+
+        self.mcp_toggle_btn = QtWidgets.QPushButton("Start Server")
+        self.mcp_toggle_btn.setFixedHeight(30)
+        self.mcp_toggle_btn.setMinimumWidth(100)
+        self.mcp_toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        mcp_row.addWidget(self.mcp_toggle_btn, 0, QtCore.Qt.AlignBottom)
+
+        self.mcp_yolo_chk = QtWidgets.QCheckBox("YOLO Mode (Bypass Permissions)")
+        self.mcp_yolo_chk.setToolTip("Allow dangerous and destructive tools without prompt")
+        self.mcp_yolo_chk.setChecked(os.environ.get("HOUDINIMIND_MCP_ALLOW_DANGEROUS", "") == "1")
+        self.mcp_yolo_chk.stateChanged.connect(self._on_yolo_changed)
+        mcp_layout.addWidget(self.mcp_yolo_chk)
+
+        mcp_layout.addLayout(mcp_row)
+        self.settings_sections.addItem(mcp_box, "MCP")
+        self._section_widgets.append((mcp_box, "mcp server port status start stop"))
         self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
         self._sync_backend_fields()
+
+    def _on_yolo_changed(self, state):
+        val = "1" if state == QtCore.Qt.Checked else "0"
+        os.environ["HOUDINIMIND_MCP_ALLOW_DANGEROUS"] = val
+        try:
+            import houdinimind.agent.mcp_houdini_server as mhs
+
+            if mhs._server_instance:
+                mhs._server_instance.allow_dangerous = val == "1"
+        except Exception:
+            pass
+
+    def _filter_sections(self, query: str) -> None:
+        needle = str(query or "").strip().lower()
+        first_match = -1
+        for index, (widget, keywords) in enumerate(self._section_widgets):
+            haystack = f"{self.settings_sections.itemText(index)} {keywords}".lower()
+            visible = not needle or needle in haystack
+            widget.setVisible(visible)
+            self.settings_sections.setItemEnabled(index, visible)
+            if visible and first_match < 0:
+                first_match = index
+        if first_match >= 0:
+            self.settings_sections.setCurrentIndex(first_match)
+
+    def set_model_status(self, text: str, tone: str = "neutral") -> None:
+        color = {
+            "ok": ModernStyles.ACCENT_SUCCESS,
+            "warn": ModernStyles.ACCENT_WARN,
+            "error": ModernStyles.ACCENT_DANGER,
+        }.get(tone, ModernStyles.TEXT_DIM)
+        self.model_status_lbl.setText(text)
+        self.model_status_lbl.setStyleSheet(f"color: {color}; font-size: 10px;")
+
+    def load_config(self, config: dict) -> None:
+        """Refresh controls from a config loaded after the panel was built."""
+        config = config or {}
+        controls = [
+            self.chat_model_combo,
+            self.vision_model_combo,
+            self.asr_model_combo,
+            self.asr_input_combo,
+            self.backend_combo,
+            self.temp_slider,
+            self.ctx_spin,
+            self.rounds_spin,
+            self.url_edit,
+            self.openai_url_edit,
+            self.api_key_edit,
+            self.backup_chk,
+            self.scene_chk,
+            self.tools_chk,
+            self.llm_trace_chk,
+            self.network_audit_chk,
+            self.mcp_port_spin,
+        ]
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            chat_model = str(config.get("model", "") or "")
+            vision_model = str(config.get("vision_model", "") or "")
+            if chat_model:
+                self.chat_model_combo.setCurrentText(chat_model)
+            if vision_model:
+                self.vision_model_combo.setCurrentText(vision_model)
+
+            backend_value = str(config.get("backend", "ollama") or "ollama").strip().lower()
+            backend_index = self.backend_combo.findData(backend_value)
+            self.backend_combo.setCurrentIndex(backend_index if backend_index >= 0 else 0)
+
+            self.temp_slider.setValue(int(float(config.get("temperature", 0.3)) * 100))
+            self.temp_lbl.setText(f"{self.temp_slider.value() / 100:.2f}")
+            self.ctx_spin.setValue(int(config.get("context_window", 32768)))
+            self.rounds_spin.setValue(int(config.get("max_tool_rounds", 16)))
+            self.url_edit.setText(str(config.get("ollama_url", "http://localhost:11434") or ""))
+            self.openai_url_edit.setText(
+                str(config.get("openai_base_url", "https://integrate.api.nvidia.com/v1") or "")
+            )
+
+            api_key = ""
+            try:
+                from houdinimind.agent.credential_store import CredentialStore
+
+                api_key = CredentialStore(config.get("data_dir", "")).get_api_key()
+            except Exception:
+                api_key = str(config.get("api_key", "") or "")
+            self.api_key_edit.setText(api_key)
+
+            asr_model = str(config.get("asr_model", "base.en") or "base.en")
+            asr_idx = self.asr_model_combo.findData(asr_model)
+            self.asr_model_combo.setCurrentIndex(asr_idx if asr_idx >= 0 else 0)
+            self._populate_asr_input_devices(config)
+            self.backup_chk.setChecked(bool(config.get("auto_backup", False)))
+            ui_cfg = config.get("ui", {}) or {}
+            self.scene_chk.setChecked(bool(ui_cfg.get("auto_inject_scene_on_chat", False)))
+            self.tools_chk.setChecked(bool(ui_cfg.get("show_tool_calls", True)))
+            self.llm_trace_chk.setChecked(bool(ui_cfg.get("show_llm_trace_history", True)))
+            self.network_audit_chk.setChecked(bool(config.get("auto_network_view_checks", True)))
+            self.mcp_port_spin.setValue(int(config.get("mcp_port", 9876)))
+            self._sync_backend_fields()
+        finally:
+            for control in controls:
+                control.blockSignals(False)
 
     def _current_backend(self) -> str:
         return str(self.backend_combo.currentData() or "ollama")
 
     def _on_backend_changed(self, _index):
+        self._sync_backend_fields()
         self._emit()
 
     def _sync_backend_fields(self):
         is_nvidia = self._current_backend() == "nvidia"
-        if hasattr(self, "url_label"):
-            self.url_label.setVisible(not is_nvidia)
+        self.url_label.setVisible(not is_nvidia)
         self.url_edit.setVisible(not is_nvidia)
-        if hasattr(self, "openai_url_label"):
-            self.openai_url_label.setVisible(is_nvidia)
-            self.openai_url_edit.setVisible(is_nvidia)
-            self.api_key_label.setVisible(is_nvidia)
-            self.api_key_edit.setVisible(is_nvidia)
+        self.openai_url_label.setVisible(is_nvidia)
+        self.openai_url_edit.setVisible(is_nvidia)
+        self.api_key_label.setVisible(is_nvidia)
+        self.api_key_edit.setVisible(is_nvidia)
         if is_nvidia:
             chat_model = self.chat_model_combo.current_model()
             vision_model = self.vision_model_combo.current_model()
@@ -886,17 +1122,16 @@ class SettingsPanel(QtWidgets.QFrame):
                 "auto_network_view_checks": self.network_audit_chk.isChecked(),
                 "vision_enabled": True,
                 "ollama_url": self.url_edit.text().strip(),
-                "openai_base_url": getattr(self, "openai_url_edit", self.url_edit).text().strip()
-                if hasattr(self, "openai_url_edit")
-                else "",
-                "api_key": getattr(self, "api_key_edit", self.url_edit).text().strip()
-                if hasattr(self, "api_key_edit")
-                else "",
+                "openai_base_url": self.openai_url_edit.text().strip(),
+                "api_key": self.api_key_edit.text().strip(),
                 "asr_model": self.asr_model_combo.currentData() or "base.en",
                 "asr_input_device": self.asr_input_combo.currentData() or "auto",
+                "mcp_port": self.mcp_port_spin.value(),
                 "ui": {
                     "auto_inject_scene_on_chat": self.scene_chk.isChecked(),
                     "show_tool_calls": self.tools_chk.isChecked(),
+                    "show_llm_trace_history": self.llm_trace_chk.isChecked(),
+                    "raw_llm_response": self.llm_trace_chk.isChecked(),
                 },
             }
         )
@@ -1073,6 +1308,12 @@ class AgentStatusRow(QtWidgets.QWidget):
 class CompactMessageLabel(QtWidgets.QLabel):
     """QLabel with stable wrapped height inside scroll layouts."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setMargin(0)
+        self.setIndent(0)
+
     def hasHeightForWidth(self) -> bool:
         return True
 
@@ -1087,9 +1328,10 @@ class CompactMessageLabel(QtWidgets.QLabel):
             return max(self.fontMetrics().height(), rect.height() + 2)
         doc = QtGui.QTextDocument()
         doc.setDefaultFont(self.font())
+        doc.setDocumentMargin(0)
         doc.setHtml(text)
         doc.setTextWidth(float(w))
-        return max(self.fontMetrics().height(), int(doc.size().height()) + 2)
+        return max(self.fontMetrics().height(), int(doc.size().height()))
 
     def sizeHint(self) -> QtCore.QSize:
         w = max(120, int(self.width() or 400))
@@ -1106,10 +1348,72 @@ class CompactMessageLabel(QtWidgets.QLabel):
 
 def _md_to_html(text: str) -> str:
     """
-    Convert a subset of Markdown to HTML suitable for QLabel rich text.
-    Handles: headings, bold, italic, inline code, fenced code blocks,
-    bullet lists, numbered lists, horizontal rules.
+    Convert Markdown to HTML suitable for QLabel rich text.
+    Tries to use the robust `markdown` library with `pygments` if available.
+    Falls back to a custom parser if not.
     """
+    try:
+        import markdown
+
+        extensions = ["fenced_code", "tables", "sane_lists"]
+        extension_configs = {}
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("pygments") is not None:
+                extensions.append("codehilite")
+                extension_configs["codehilite"] = {
+                    "noclasses": True,
+                    "style": "monokai",
+                    "cssclass": "highlight",
+                }
+        except ImportError:
+            pass
+
+        html_out = markdown.markdown(
+            text, extensions=extensions, extension_configs=extension_configs
+        )
+
+        # Inject compact styles into generated html tags. Qt rich text applies
+        # browser-like default paragraph margins unless every block is styled.
+        html_out = html_out.replace(
+            "<p>",
+            f'<p style="margin:0 0 4px 0; color:{ModernStyles.TEXT};">',
+        )
+        html_out = html_out.replace(
+            "<ul>",
+            '<ul style="margin:2px 0 4px 0; padding-left:18px;">',
+        )
+        html_out = html_out.replace(
+            "<ol>",
+            '<ol style="margin:2px 0 4px 0; padding-left:18px;">',
+        )
+        html_out = html_out.replace("<li>", '<li style="margin:0 0 2px 0;">')
+        html_out = html_out.replace(
+            "<code>",
+            f'<code style="background:{ModernStyles.INLINE_CODE_BG}; color:{ModernStyles.ACCENT}; font-family:Consolas,monospace; font-size:11px; padding:1px 4px">',
+        )
+        html_out = html_out.replace(
+            "<pre>",
+            f'<pre style="background:{ModernStyles.CODE_BG}; border:1px solid {ModernStyles.BORDER_SOFT}; border-left:3px solid {ModernStyles.ACCENT}; border-radius:4px; padding:6px 8px; margin:4px 0; font-family:Consolas,monospace; font-size:11px; color:{ModernStyles.TEXT}; white-space:pre-wrap;">',
+        )
+        html_out = html_out.replace(
+            "<table>",
+            f'<table style="border-collapse: collapse; margin: 4px 0; border: 1px solid {ModernStyles.BORDER};">',
+        )
+        html_out = html_out.replace(
+            "<th>",
+            f'<th style="border: 1px solid {ModernStyles.BORDER}; padding: 4px 8px; background-color: {ModernStyles.BG_ALT};">',
+        )
+        html_out = html_out.replace(
+            "<td>", f'<td style="border: 1px solid {ModernStyles.BORDER}; padding: 4px 8px;">'
+        )
+        html_out = html_out.replace("<a>", '<a style="color:#8fb8d8;text-decoration:none">')
+
+        return f'<div style="margin:0; padding:0; color:{ModernStyles.TEXT};">{html_out}</div>'
+    except ImportError:
+        pass
+
     import html
     import re
 
@@ -1119,6 +1423,64 @@ def _md_to_html(text: str) -> str:
     code_buf = []
     code_lang = ""
     in_list = False
+
+    def parse_fence_info(info: str) -> tuple[str, str]:
+        raw = str(info or "").strip()
+        if not raw:
+            return "", ""
+        known_langs = (
+            "python",
+            "py",
+            "vex",
+            "vfl",
+            "cpp",
+            "c++",
+            "c",
+            "json",
+            "bash",
+            "sh",
+            "text",
+            "hscript",
+        )
+        lower = raw.lower()
+        for lang in known_langs:
+            if lower == lang:
+                return lang, ""
+            if lower.startswith(lang + "#"):
+                return lang, raw[len(lang) :].strip()
+            if lower.startswith(lang + " "):
+                return lang, raw[len(lang) :].strip()
+        if raw.startswith("#"):
+            return "", raw
+        first, _, rest = raw.partition(" ")
+        if re.fullmatch(r"[A-Za-z0-9_+.-]{1,24}", first):
+            return first, rest.strip()
+        return "", raw
+
+    def render_code_block(lang: str, code_lines: list[str]) -> str:
+        # LLMs occasionally emit fences with dozens of blank lines or malformed
+        # info strings. Trim only outer whitespace so intentional indentation is
+        # preserved but empty panels do not consume the whole chat lane.
+        while code_lines and not code_lines[0].strip():
+            code_lines.pop(0)
+        while code_lines and not code_lines[-1].strip():
+            code_lines.pop()
+        if not code_lines:
+            return ""
+        code_text = html.escape("\n".join(code_lines))
+        lang_label = (
+            f'<div style="color:{ModernStyles.TEXT_SUBTLE};font-size:10px;'
+            f'margin-bottom:4px">{html.escape(lang)}</div>'
+            if lang
+            else ""
+        )
+        return (
+            f'<pre style="background:{ModernStyles.CODE_BG};border:1px solid {ModernStyles.BORDER_SOFT};'
+            f"border-left:3px solid {ModernStyles.ACCENT};border-radius:4px;"
+            f"padding:6px 8px;margin:4px 0;font-family:Consolas,monospace;font-size:11px;"
+            f'color:{ModernStyles.TEXT};white-space:pre-wrap;">'
+            f"{lang_label}{code_text}</pre>"
+        )
 
     def flush_list():
         nonlocal in_list
@@ -1135,24 +1497,15 @@ def _md_to_html(text: str) -> str:
             if not in_code:
                 flush_list()
                 in_code = True
-                code_lang = line.strip()[3:].strip()
+                code_lang, first_code_line = parse_fence_info(line.strip()[3:].strip())
                 code_buf = []
+                if first_code_line:
+                    code_buf.append(first_code_line)
             else:
                 in_code = False
-                code_text = html.escape("\n".join(code_buf))
-                lang_label = (
-                    f'<div style="color:{ModernStyles.TEXT_SUBTLE};font-size:10px;'
-                    f'margin-bottom:4px">{html.escape(code_lang)}</div>'
-                    if code_lang
-                    else ""
-                )
-                out.append(
-                    f'<pre style="background:{ModernStyles.CODE_BG};border:1px solid {ModernStyles.BORDER_SOFT};'
-                    f"border-left:3px solid {ModernStyles.ACCENT};border-radius:4px;"
-                    f"padding:8px 10px;margin:7px 0;font-family:Consolas,monospace;font-size:11px;"
-                    f'line-height:140%;color:{ModernStyles.TEXT};white-space:pre-wrap;">'
-                    f"{lang_label}{code_text}</pre>"
-                )
+                rendered = render_code_block(code_lang, code_buf)
+                if rendered:
+                    out.append(rendered)
                 code_buf = []
                 code_lang = ""
             i += 1
@@ -1182,7 +1535,7 @@ def _md_to_html(text: str) -> str:
             sizes = {1: "14px", 2: "13px", 3: "12px"}
             content = _inline_md(m.group(2))
             out.append(
-                f'<p style="margin:6px 0 2px 0;font-size:{sizes[level]};'
+                f'<p style="margin:3px 0 2px 0;font-size:{sizes[level]};'
                 f'font-weight:700;color:{ModernStyles.TEXT}">{content}</p>'
             )
             i += 1
@@ -1192,7 +1545,7 @@ def _md_to_html(text: str) -> str:
         m = re.match(r"^(\s*)[-*+]\s+(.*)", raw)
         if m:
             if not in_list:
-                out.append('<ul style="margin:4px 0 5px 0;padding-left:18px">')
+                out.append('<ul style="margin:2px 0 4px 0;padding-left:18px">')
                 in_list = True
             content = _inline_md(m.group(2))
             out.append(f'<li style="margin:2px 0">{content}</li>')
@@ -1204,7 +1557,7 @@ def _md_to_html(text: str) -> str:
         if m:
             flush_list()
             content = _inline_md(m.group(2))
-            out.append(f'<p style="margin:2px 0;padding-left:16px">{content}</p>')
+            out.append(f'<p style="margin:0 0 2px 0;padding-left:16px">{content}</p>')
             i += 1
             continue
 
@@ -1212,15 +1565,19 @@ def _md_to_html(text: str) -> str:
 
         # Blank line → paragraph break
         if raw.strip() == "":
-            out.append("<br>")
+            out.append('<div style="height:4px"></div>')
             i += 1
             continue
 
-        out.append(f'<p style="margin:2px 0; line-height:145%">{_inline_md(raw)}</p>')
+        out.append(f'<p style="margin:0 0 4px 0">{_inline_md(raw)}</p>')
         i += 1
 
     flush_list()
-    return "".join(out)
+    if in_code:
+        rendered = render_code_block(code_lang, code_buf)
+        if rendered:
+            out.append(rendered)
+    return f'<div style="margin:0;padding:0;color:{ModernStyles.TEXT};">{"".join(out)}</div>'
 
 
 def _inline_md(text: str) -> str:
@@ -1487,6 +1844,58 @@ class MessageBubble(QtWidgets.QFrame):
         hdr.addStretch()
         layout.addLayout(hdr)
 
+        self._trace_expander_btn = QtWidgets.QPushButton("▼ LLM Thinking")
+        self._trace_expander_btn.setStyleSheet(
+            f"color: {ModernStyles.ACCENT}; font-size: 10px; font-weight: 600; "
+            f"background: transparent; border: none; text-align: left; padding: 0;"
+        )
+        self._trace_expander_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._trace_expander_btn.setVisible(False)
+        self._trace_expander_btn.setFixedHeight(18)
+        layout.addWidget(self._trace_expander_btn)
+
+        self._trace_container = QtWidgets.QFrame()
+        self._trace_container.setVisible(False)
+        self._trace_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        self._trace_container.setStyleSheet(
+            f"background: {ModernStyles.PANEL_SOFT}; border: 1px solid {ModernStyles.BORDER_SOFT}; "
+            f"border-left: 2px solid {ModernStyles.ACCENT}; border-radius: 4px; padding: 0px;"
+        )
+        self._trace_layout = QtWidgets.QVBoxLayout(self._trace_container)
+        self._trace_layout.setContentsMargins(7, 5, 7, 5)
+        self._trace_layout.setSpacing(2)
+
+        self._trace_label = QtWidgets.QPlainTextEdit()
+        self._trace_label.setReadOnly(True)
+        self._trace_label.document().setDocumentMargin(0)
+        self._trace_label.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._trace_label.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self._trace_label.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self._trace_label.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._trace_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard
+        )
+        self._trace_label.setStyleSheet(
+            f"QPlainTextEdit {{ color: {ModernStyles.TEXT_DIM}; font-size: 10px; "
+            f"font-family: 'Consolas', 'Courier New', monospace; background: transparent; "
+            f"border: none; padding: 0; selection-background-color: {ModernStyles.ACCENT}; "
+            f"selection-color: #ffffff; }}"
+        )
+        self._trace_label.setMinimumHeight(86)
+        self._trace_label.setMaximumHeight(220)
+        self._trace_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        self._trace_layout.addWidget(self._trace_label)
+        self._trace_container.setFixedHeight(104)
+        layout.addWidget(self._trace_container)
+
+        self._trace_expanded = False
+        self._trace_text = ""
+        self._trace_expander_btn.clicked.connect(self._toggle_trace)
+
         self.text_label = CompactMessageLabel()
         self.text_label.setWordWrap(True)
         self.text_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
@@ -1505,7 +1914,7 @@ class MessageBubble(QtWidgets.QFrame):
         self.text_label.setStyleSheet(
             f"background: transparent; border: none; "
             f"color: {ModernStyles.TEXT if self._role != 'user' else '#dde3ef'}; "
-            f"font-size: 12px; line-height: 145%;"
+            f"font-size: 12px;"
         )
         self._render_text()
         layout.addWidget(self.text_label)
@@ -1531,6 +1940,7 @@ class MessageBubble(QtWidgets.QFrame):
         self.footer_layout.setContentsMargins(0, 4, 0, 0)
         self.footer_layout.setSpacing(6)
         self.footer.setVisible(False)
+        self._footer_extra_widget = None
         layout.addWidget(self.footer)
 
         # Timestamp — far left
@@ -1585,6 +1995,14 @@ class MessageBubble(QtWidgets.QFrame):
 
         self._sync_container_width()
 
+    def _toggle_trace(self):
+        self._trace_expanded = not self._trace_expanded
+        self._trace_container.setVisible(self._trace_expanded)
+        self._trace_expander_btn.setText(
+            "▼ LLM Thinking" if self._trace_expanded else "▶ LLM Thinking"
+        )
+        self._resize()
+
     def _get_bubble_bg(self):
         if self._role == "user":
             return ModernStyles.USER_BUBBLE
@@ -1609,7 +2027,7 @@ class MessageBubble(QtWidgets.QFrame):
             self.text_label.setTextFormat(QtCore.Qt.RichText)
             escaped = html.escape(self._text).replace("\n", "<br>")
             self.text_label.setText(
-                f'<div style="line-height:145%; color:#dde3ef;">{escaped}</div>'
+                f'<div style="margin:0;padding:0;color:#dde3ef;">{escaped}</div>'
             )
         else:
             if self._stream_plain_mode:
@@ -1629,43 +2047,56 @@ class MessageBubble(QtWidgets.QFrame):
             self._code_copy_btn.setVisible(has_code)
         self._sync_text_label_height()
 
-    def _sync_text_label_height(self):
+    def _sync_text_label_height(self) -> bool:
         if not getattr(self, "text_label", None):
-            return
+            return False
         width = self.text_label.contentsRect().width()
         if width < 120 and getattr(self, "container", None):
             width = self.container.contentsRect().width() - 4
         if width < 120:
             QtCore.QTimer.singleShot(0, self._sync_text_label_height)
-            return
+            return False
         height = self.text_label.heightForWidth(width)
         if not (self._text or "").strip():
             height = 0
-        height = max(0, min(int(height) + 2, 1200))
+        height = max(
+            0, min(int(height), 10000)
+        )  # Increased from 1200 to 10000 to prevent long bubbles from clipping
+
+        changed = False
         if self.text_label.height() != height:
             self.text_label.setFixedHeight(height)
-        self.text_label.updateGeometry()
-        if getattr(self, "container", None):
-            self.container.updateGeometry()
-        self.updateGeometry()
+            changed = True
+
+        if getattr(self, "_trace_container", None):
+            trace_height = 104 if getattr(self, "_trace_expanded", False) else 0
+            if self._trace_container.height() != trace_height:
+                self._trace_container.setFixedHeight(trace_height)
+                changed = True
+
+        if changed:
+            self.text_label.updateGeometry()
+            if getattr(self, "_trace_label", None):
+                self._trace_label.updateGeometry()
+            if getattr(self, "container", None):
+                self.container.updateGeometry()
+            self.updateGeometry()
+        return changed
 
     def _resize(self):
         self._sync_container_width()
-        self._sync_text_label_height()
-        # Notify the layout chain that our preferred size changed.
-        # Walk up to the scroll area's viewport widget so it reflows properly
-        # during streaming without locking any widget to a fixed size.
-        self.text_label.updateGeometry()
-        self.container.updateGeometry()
-        self.updateGeometry()
+        height_changed = self._sync_text_label_height()
+
         self._refresh_inline_status_text()
-        p = self.parent()
-        while p is not None:
-            p.updateGeometry()
-            # Stop at the scroll area viewport — no need to go further
-            if isinstance(p, QtWidgets.QAbstractScrollArea):
-                break
-            p = p.parent()
+
+        if height_changed:
+            p = self.parent()
+            while p is not None:
+                p.updateGeometry()
+                # Stop at the scroll area viewport — no need to go further
+                if isinstance(p, QtWidgets.QAbstractScrollArea):
+                    break
+                p = p.parent()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1742,12 +2173,31 @@ class MessageBubble(QtWidgets.QFrame):
         self._resize()
 
     def set_llm_activity(self, text: str):
-        # Tool/LLM activity belongs in the side inspector and Agent Notes, not
-        # inside the chat bubble. Keeping it out avoids oversized empty cards.
-        return
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return
+        if self._trace_text:
+            self._trace_text += "\n" + cleaned
+        else:
+            self._trace_text = cleaned
+            self._trace_expander_btn.setVisible(True)
+            self._trace_expanded = True
+            self._trace_container.setVisible(True)
+            self._trace_expander_btn.setText("▼ LLM Thinking")
+
+        self._trace_label.setPlainText(self._trace_text)
+        cursor = self._trace_label.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        self._trace_label.setTextCursor(cursor)
+        self._resize()
 
     def clear_llm_activity(self):
-        return
+        self._trace_text = ""
+        self._trace_expander_btn.setVisible(False)
+        self._trace_container.setVisible(False)
+        self._trace_expanded = False
+        self._trace_label.setPlainText("")
+        self._resize()
 
     def append_text(self, chunk: str):
         self._text += chunk
@@ -1818,7 +2268,13 @@ class MessageBubble(QtWidgets.QFrame):
         self._clear_footer_chips()
         widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         widget.setMaximumHeight(20)
-        self.footer_layout.addWidget(widget)
+        insert_at = self.footer_layout.indexOf(getattr(self, "_code_copy_btn", None))
+        if insert_at < 0:
+            insert_at = self.footer_layout.indexOf(self._copy_btn)
+        if insert_at < 0:
+            insert_at = self.footer_layout.count()
+        self.footer_layout.insertWidget(insert_at, widget)
+        self._footer_extra_widget = widget
         self.footer.setVisible(True)
 
     def clear_footer_widget(self):
@@ -1829,13 +2285,13 @@ class MessageBubble(QtWidgets.QFrame):
             self.footer.setVisible(False)
 
     def _clear_footer_chips(self):
-        """Remove all footer items except the timer label and the stretch."""
-        # Items: [timer_label, stretch, ...chips]
-        while self.footer_layout.count() > 2:
-            item = self.footer_layout.takeAt(self.footer_layout.count() - 1)
-            child = item.widget()
-            if child is not None:
-                child.setParent(None)
+        """Remove only the dynamic feedback widget, preserving footer controls."""
+        widget = getattr(self, "_footer_extra_widget", None)
+        if widget is None:
+            return
+        self.footer_layout.removeWidget(widget)
+        widget.setParent(None)
+        self._footer_extra_widget = None
 
     def _copy(self):
         QtWidgets.QApplication.clipboard().setText(self._text)
@@ -2391,12 +2847,63 @@ class FailureActionStrip(QtWidgets.QFrame):
         root.addWidget(diag_btn)
 
 
+class TurnSummaryWidget(QtWidgets.QFrame):
+    details_requested = QtCore.Signal()
+    tools_requested = QtCore.Signal()
+
+    def __init__(
+        self,
+        created: int = 0,
+        updated: int = 0,
+        output: str = "",
+        warnings: int = 0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("turn_summary")
+        accent = ModernStyles.ACCENT_WARN if warnings else ModernStyles.ACCENT_SUCCESS
+        self.setStyleSheet(
+            f"QFrame#turn_summary {{ background: {ModernStyles.PANEL_SOFT}; "
+            f"border: 1px solid {ModernStyles.BORDER_SOFT}; border-left: 2px solid {accent}; "
+            "border-radius: 0px; }}"
+        )
+
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(10, 6, 10, 6)
+        root.setSpacing(8)
+
+        parts = [f"Created {created}", f"Updated {updated}", f"Warnings {warnings}"]
+        if output:
+            parts.append(f"Output {output}")
+        label = QtWidgets.QLabel("  |  ".join(parts))
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard
+        )
+        label.setStyleSheet(f"color: {ModernStyles.TEXT_DIM}; font-size: 10px;")
+        root.addWidget(label, 1)
+
+        scene_btn = QtWidgets.QPushButton("Scene")
+        scene_btn.setObjectName("ghost_btn")
+        scene_btn.setFixedHeight(22)
+        scene_btn.setToolTip("Open scene details for this turn")
+        scene_btn.clicked.connect(self.details_requested.emit)
+        root.addWidget(scene_btn)
+
+        tools_btn = QtWidgets.QPushButton("Tools")
+        tools_btn.setObjectName("ghost_btn")
+        tools_btn.setFixedHeight(22)
+        tools_btn.setToolTip("Open tool trace for this turn")
+        tools_btn.clicked.connect(self.tools_requested.emit)
+        root.addWidget(tools_btn)
+
+
 class FeedbackChip(QtWidgets.QLabel):
     def __init__(self, accepted: bool, parent=None):
-        text = "+1 Saved"
+        text = "Thumbs up saved"
         object_name = "feedback_chip"
         if not accepted:
-            text = "-1 Avoid"
+            text = "Thumbs down saved"
             object_name = "feedback_chip_reject"
         super().__init__(text, parent)
         self.setObjectName(object_name)

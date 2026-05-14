@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-05-14
+### Added
+- Agentic controller, workflow state, precondition, clarification, credential, budgeting, and retry support.
+- Cognitive memory and expanded RAG 2.0 retrieval components.
+- Additional Houdini knowledge, recipes, documentation, and agent workflow references.
+
+### Changed
+- Updated the Houdini panel, agent loop, tool registry, model adapter, MCP server, and retrieval pipeline for the next major release.
+- Expanded tests for agent foundations, intelligence logic, MCP bridge configuration, agentic control, and cognitive memory.
+
 ## [1.0.0] - 2026-04-28
 ### Added
 - Initial public release of HoudiniMind.
@@ -15,4 +25,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deep RAG integration with 700+ SOP node docs and FX recipes.
 - Model Context Protocol (MCP) server for external editor integration (Cursor, etc.).
 - Comprehensive "Zero-Warning" tool API with built-in schema validation.
-
