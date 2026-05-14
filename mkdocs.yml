@@ -1,0 +1,19 @@
+site_name: HoudiniMind
+site_description: Agentic AI for SideFX Houdini 21.
+site_url: https://anshul-vashist.github.io/Houdini-Agent/
+repo_url: https://github.com/anshul-vashist/Houdini-Agent
+repo_name: anshul-vashist/Houdini-Agent
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Agent Metadata Integration: AGENT_METADATA_INTEGRATION.md
+  - Metadata-Aware Retrieval: METADATA_AWARE_RETRIEVAL.md
+  - Production Agentic AI Redesign: PRODUCTION_AGENTIC_AI_REDESIGN.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
